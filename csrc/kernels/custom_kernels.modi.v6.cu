@@ -439,6 +439,7 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
 
         for (int n = 0; n < N; n++) {
           scalar_t* a_addr = &s[k_ + n * K];
+          // bigA[n][k2] = *((const bigType*)a_addr);
           lds_read_dwordx4_async(bigA[n][k2].h8, (scalar8*)a_addr);
         }
       }
