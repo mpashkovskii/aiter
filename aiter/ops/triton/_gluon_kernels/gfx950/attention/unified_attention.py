@@ -1681,6 +1681,94 @@ def attention_loop_standard(pgm, kv_loader, q, M, L, acc):
 
 
 @gluon.jit
+def attention_loop_pipelined(pgm, kv_loader, q, M, L, acc):
+    """Double-buffered loop that issues the QK of tile j+1 before the softmax and PV of tile j.
+
+    S is double-buffered in registers, so the MFMA chain of the next tile is independent of the
+    softmax VALU work of the current one. K ring: 2 slots, loaded two tiles ahead; V ring: 2 slots,
+    loaded one tile ahead (4 tiles of LDS, same as attention_loop_standard). The mask of the next
+    tile is applied after the PV so that QK(j+1) and softmax(j) stay in one basic block.
+    """
+    j0 = pgm.tile_start
+    b0 = kv_loader.load_block_ids(j0)
+    kv_loader.load_k_to_shared(b0, buffer_id=0)
+    gl.amd.cdna4.async_copy.wait_group(0)
+    _barrier()
+    k = kv_loader.load_k_from_shared(
+        wait_count=0,
+        target_dtype=q.dtype,
+        buffer_id=0,
+        skip_wait=True,
+        RELAXED=True,
+    )
+    S = pgm.compute_qk(k)
+    if pgm.cfg.SLIDING_WINDOW > 0:
+        S = pgm.apply_mask_qk(S, j0)
+    else:
+        if j0 >= pgm.safe_tile_end:
+            S = pgm.apply_mask_qk(S, j0)
+    kv_loader.load_k_to_shared(
+        kv_loader.load_block_ids(gl.minimum(j0 + 1, pgm.tile_end - 1)), buffer_id=1
+    )
+    kv_loader.load_v_to_shared(b0, buffer_id=0)
+    buffer_id: gl.int32 = 0
+    for j in range(j0, pgm.tile_end - 1):
+        gl.amd.cdna4.async_copy.wait_group(0)
+        _barrier()
+        # K_{j+2} goes into the slot QK_j already consumed, V_{j+1} into the slot PV_{j-1} freed
+        # prefetch indices are clamped to the last tile so no block-table entry past the sequence is read
+        kv_loader.load_k_to_shared(
+            kv_loader.load_block_ids(gl.minimum(j + 2, pgm.tile_end - 1)),
+            buffer_id=buffer_id,
+        )
+        kv_loader.load_v_to_shared(
+            kv_loader.load_block_ids(j + 1), buffer_id=1 - buffer_id
+        )
+        k = kv_loader.load_k_from_shared(
+            wait_count=0,
+            target_dtype=q.dtype,
+            buffer_id=1 - buffer_id,
+            skip_wait=True,
+            RELAXED=True,
+        )
+        S_next = pgm.compute_qk(k)
+        S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
+        p, alpha, M = pgm.softmax_part0(S, M)
+        p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
+        v = kv_loader.load_v_from_shared(
+            wait_count=0,
+            target_dtype=q.dtype,
+            buffer_id=buffer_id,
+            skip_wait=True,
+            RELAXED=True,
+        )
+        acc = pgm.compute_pv(p, v, acc)
+        if pgm.cfg.SLIDING_WINDOW > 0:
+            S_next = pgm.apply_mask_qk(S_next, j + 1)
+        else:
+            if j + 1 >= pgm.safe_tile_end:
+                S_next = pgm.apply_mask_qk(S_next, j + 1)
+        S = S_next
+        buffer_id = 1 - buffer_id
+
+    # Last tile: its S is already computed (and masked)
+    gl.amd.cdna4.async_copy.wait_group(0)
+    _barrier()
+    S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
+    p, alpha, M = pgm.softmax_part0(S, M)
+    p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
+    v = kv_loader.load_v_from_shared(
+        wait_count=0,
+        target_dtype=q.dtype,
+        buffer_id=buffer_id,
+        skip_wait=True,
+        RELAXED=True,
+    )
+    acc = pgm.compute_pv(p, v, acc)
+    return M, L, acc
+
+
+@gluon.jit
 def find_seq_idx(
     query_start_len_ptr,
     target_idx,
@@ -1988,6 +2076,15 @@ def _unified_attention_gluon_kernel(
     acc = gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
     if NUM_BUFFERS == 1:
         M, L, acc = attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc)
+    elif (
+        (HEAD_SIZE >= 512)
+        and (not ALL_DECODE)
+        and (NUM_SPLITS == 1)
+        and (NUM_WARPS > 1)
+    ):
+        # head size 512: the standard loop keeps Q (64 VGPRs) next to a 256-register
+        # accumulator and spills; the software-pipelined loop does not
+        M, L, acc = attention_loop_pipelined(pgm, kv_loader, q, M, L, acc)
     else:
         M, L, acc = attention_loop_standard(pgm, kv_loader, q, M, L, acc)
 
