@@ -132,7 +132,7 @@ class _UAParams(NamedTuple):
 _GFX950_GLUON_HD512_MIN_TOKENS = 768
 _UA_HIP_MIN_TOKENS = {
     512: _GFX950_GLUON_HD512_MIN_TOKENS,
-    256: int(os.environ.get("AITER_UA_HD256_MIN_TOKENS", "256")),
+    256: int(os.environ.get("AITER_UA_HD256_MIN_TOKENS", "1")),
 }
 
 
