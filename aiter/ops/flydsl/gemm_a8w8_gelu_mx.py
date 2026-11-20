@@ -5,7 +5,8 @@
 matching MX (1x32 E8M0 activation scales) down GEMM with a per-channel FP8 weight scale.
 
 ``flydsl_gate_up_gelu_mx`` turns per-token FP8 activations and the merged gate_up weight into the FP8 hidden
-activation ``[M, I]`` plus E8M0 scales ``[M, I/32]`` in one kernel; ``flydsl_mx_down`` consumes them. Weights go
+activation ``[M, I]`` plus E8M0 scales (``shuffle_scale_w4`` layout, rows padded to 256) in one kernel;
+``flydsl_mx_down`` consumes them. Weights go
 through ``prepare_gate_up_weight`` / ``shuffle_weight`` once at load time.
 """
 
@@ -64,6 +65,11 @@ def prepare_gate_up_weight(w: Tensor, w_scale: Tensor) -> tuple[Tensor, Tensor]:
     )
 
 
+def scale_numel(rows: int, k: int) -> int:
+    """Bytes of a ``shuffle_scale_w4`` E8M0 scale for ``rows`` rows and K = ``k`` (rows padded to 256)."""
+    return -(-rows // 256) * 256 * (k // 32)
+
+
 def is_supported_shape(m: int, n: int, k: int) -> bool:
     return (
         n % (2 * HALF_TILE) == 0
@@ -98,7 +104,7 @@ def _compile_down(k: int, waves_per_eu: int, xcd_swizzle: int):
     return compile_mxfp8_gemm_8w_chan(
         K=k,
         b_preshuffled=True,
-        scale_preshuffled=False,
+        scale_preshuffled=True,
         waves_per_eu=waves_per_eu,
         xcd_swizzle=xcd_swizzle,
     )
@@ -124,14 +130,15 @@ def flydsl_gate_up_gelu_mx(
     xcd_swizzle: int = 4,
 ) -> None:
     """XQ ``[M, K]`` fp8; W the ``prepare_gate_up_weight`` weight ``[N, K]``; x_scale per-token fp32 ``[M]`` / ``[M, 1]``;
-    w_scale the interleaved fp32 ``[N]``. Writes ``out`` ``[M, N/2]`` fp8 and ``out_scale`` ``[M, N/64]`` uint8 (E8M0)."""
+    w_scale the interleaved fp32 ``[N]``. Writes ``out`` ``[M, N/2]`` fp8 and ``out_scale`` (flat uint8 E8M0 in the
+    ``shuffle_scale_w4`` layout, ``scale_numel(M, N/2)`` bytes)."""
     _lazy_import()
     m, k = XQ.shape
     n = W.shape[0]
     if not is_supported_shape(m, n, k):
         raise ValueError(f"[FlyDSL gelu_mx] unsupported shape M={m} N={n} K={k}")
-    if tuple(out.shape) != (m, n // 2) or tuple(out_scale.shape) != (m, n // 64):
-        raise ValueError("[FlyDSL gelu_mx] output shapes must be [M, N/2] and [M, N/64]")
+    if tuple(out.shape) != (m, n // 2) or out_scale.numel() != scale_numel(m, n // 2):
+        raise ValueError("[FlyDSL gelu_mx] out must be [M, N/2] and out_scale scale_numel(M, N/2) bytes")
     exe = _compile_gate_up(k, waves_per_eu, xcd_swizzle)
     _run_compiled(
         exe,
@@ -158,8 +165,8 @@ def flydsl_mx_down(
     waves_per_eu: int = 3,
     xcd_swizzle: int = 4,
 ) -> None:
-    """XQ ``[M, K]`` fp8 with E8M0 ``x_scale`` ``[M, K/32]``; W ``[N, K]`` 16x16 pre-shuffled fp8; ``w_unit_scale``
-    ``[N, K/32]`` uint8 filled with 127 (2**0); ``w_chan_scale`` fp32 ``[N]``; out ``[M, N]`` bf16."""
+    """XQ ``[M, K]`` fp8 with flat ``shuffle_scale_w4`` E8M0 ``x_scale``; W ``[N, K]`` 16x16 pre-shuffled fp8;
+    ``w_unit_scale`` ``scale_numel(N, K)`` uint8 filled with 127 (2**0); ``w_chan_scale`` fp32 ``[N]``; out ``[M, N]`` bf16."""
     _lazy_import()
     m, k = XQ.shape
     n = W.shape[0]

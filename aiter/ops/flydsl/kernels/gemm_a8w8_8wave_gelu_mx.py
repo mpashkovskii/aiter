@@ -9,7 +9,8 @@ followed by the 128 up rows of the same hidden units; the MFMA operands are swap
 the weight rows are read in a permuted order so that one lane holds 8 consecutive hidden columns of the gate in
 (tile0, tile1) of the c00/c10 accumulators and of the up in c01/c11. The epilogue computes ``gelu_tanh(gate) * up``,
 quantizes it per (row, 32 hidden columns) to FP8 e4m3 with a power-of-two (E8M0, rounded up) scale and writes the
-FP8 activation ``[M, N/2]`` and the E8M0 scales ``[M, N/64]``: the layout the MX (1x32) down projection consumes.
+FP8 activation ``[M, N/2]`` and the E8M0 scales in the ``shuffle_scale_w4`` layout (rows padded to 256, flat
+``ceil(M/256)*256*N/64`` bytes) that the pre-shuffled-scale MX (1x32) down projection reads without LDS staging.
 """
 
 import flydsl.compiler as flyc
@@ -78,11 +79,12 @@ class StoreActMX:
         self.c_rows = c_rows
         self.out_cols = c_cols // 2
         self.n_sc = c_cols // 64
+        self.k1_stride = c_cols // 512  # K/256 of the down projection (K = N/2)
         self.lane_id = fx.thread_idx.x % 64
         self.c_idx_fn = c_idx_fn
         self.n_tiles_a = n_tiles_a
         gC = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=c_rows * (c_cols // 2))
-        gSC = fx.rocdl.make_buffer_tensor(SC, max_size=False, num_records_bytes=c_rows * (c_cols // 64))
+        gSC = fx.rocdl.make_buffer_tensor(SC, max_size=False, num_records_bytes=((c_rows + 255) // 256) * 256 * (c_cols // 64))
         gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=c_rows * 4)
         gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=c_cols * 4)
         self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
@@ -111,7 +113,7 @@ class StoreActMX:
         r = fx.Int32(rocdl.ds_bpermute(T.i32, src, v_i32))
         return (r > v_i32).select(r, v_i32)
 
-    def store(self, c_gate, c_up, base_row, wcol0, hid_col0, sc_col):
+    def store(self, c_gate, c_up, base_row, wcol0, hid_col0, sc_k1, sc_kp, sc_l0):
         l16 = self.lane_id % 16
         sbg0 = self._sb_vec4(wcol0)
         sbg1 = self._sb_vec4(wcol0 + 4)
@@ -158,7 +160,8 @@ class StoreActMX:
             sel = (grp == fx.Int32(ti)).select(es[ti], sel)
         sel8 = Vec.filled(1, fx.Int32(sel), fx.Int32).bitcast(fx.Int8)
         fx.memref_store_vec(Vec.from_elements([sel8[0]], dtype=fx.Int8), self.reg_i8_1)
-        sc_i = (base_row + grp * 16 + l16) * self.n_sc + sc_col
+        n1 = base_row // 32 + grp // 2
+        sc_i = ((n1 * self.k1_stride + sc_k1) * 64 + sc_l0 + l16) * 4 + sc_kp * 2 + (grp % 2)
         fx.copy(self.sc_atom, self.reg_i8_1, fx.slice(self.sc_div, (None, sc_i)))
 
 
@@ -433,7 +436,9 @@ def compile_fp8_gemm_8w_gelu_mx(
         base_row = block_m * BLOCK_M + wave_m_offset
         wcol0 = block_n * BLOCK_N + wave_n_offset + (lane_id // 16) * 8
         hid0 = block_n * (BLOCK_N // 2) + wave_n_offset + (lane_id // 16) * 8
-        pcol = block_n * 4 + wave_n
+        sck1 = block_n // 2
+        sckp = block_n % 2
+        scl0 = wave_n * 16
         a0_frag = a_s2r.load(a_cur0)
         wait_barrier(0)
 
@@ -448,12 +453,12 @@ def compile_fp8_gemm_8w_gelu_mx(
 
         rocdl.s_setprio(1)
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, set_prio=False)
-        store_c.store(c00_frag, c01_frag, base_row + 0, wcol0, hid0, pcol)
+        store_c.store(c00_frag, c01_frag, base_row + 0, wcol0, hid0, sck1, sckp, scl0)
         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, set_prio=False)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
 
-        store_c.store(c10_frag, c11_frag, base_row + LDS_BLOCK_M, wcol0, hid0, pcol)
+        store_c.store(c10_frag, c11_frag, base_row + LDS_BLOCK_M, wcol0, hid0, sck1, sckp, scl0)
 
     @flyc.jit
     def launch_gemm(

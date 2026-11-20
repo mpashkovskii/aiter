@@ -539,8 +539,8 @@ def compile_mxfp8_gemm_8w_chan(
         store_c = StoreBf16(C, SW, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
         if const_expr(scale_preshuffled):
-            a_sc = ScalePreshuffledS2R(A_scale, c_m, K, N_TILES_A)
-            b_sc = ScalePreshuffledS2R(B_scale, c_n, K, N_TILES_B)
+            a_sc = ScalePreshuffledS2R(A_scale, ceildiv(c_m, BLOCK_M) * BLOCK_M, K, N_TILES_A)
+            b_sc = ScalePreshuffledS2R(B_scale, ceildiv(c_n, BLOCK_N) * BLOCK_N, K, N_TILES_B)
         else:
             raw_sc = ScaleRawLds(
                 A_scale,
