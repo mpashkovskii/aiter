@@ -157,8 +157,8 @@ def main():
     for m, (inter, hidden, _) in itertools.product(args.tokens, args.mnk):
         rows_gu.append(test_gate_up_gelu_mx(m, inter, hidden))
         rows_dn.append(test_mx_down(m, hidden, inter))
-    aiter.logger.info("gate_up + gelu*up + MX quant summary (markdown):\n%s", pd.DataFrame(rows_gu).to_markdown(index=False))
-    aiter.logger.info("MX down summary (markdown):\n%s", pd.DataFrame(rows_dn).to_markdown(index=False))
+    aiter.logger.info("gate_up + gelu*up + MX quant summary:\n%s", pd.DataFrame(rows_gu).to_string(index=False))
+    aiter.logger.info("MX down summary:\n%s", pd.DataFrame(rows_dn).to_string(index=False))
 
 
 if __name__ == "__main__":
