@@ -70,25 +70,25 @@ def _load(head_size):
 
 def supported(q, k, v, out, num_kv_heads, block_size, head_size, softcap, sinks, alibi_slopes, qq_bias,
               output_scale, sliding_window, max_seqlen_k) -> bool:
-    return (
-        head_size in _SRC
-        and enabled(head_size)
-        and sliding_window == _WINDOW[head_size]
-        and q.shape[1] == 4 * num_kv_heads
-        and block_size == 64
-        and not softcap
-        and sinks is None
-        and alibi_slopes is None
-        and qq_bias is None
-        and output_scale is None
-        and q.dtype == k.dtype == v.dtype
-        and q.dtype.itemsize == 1
-        and out.dtype == torch.bfloat16
-        and q.stride(2) == 1 and out.stride(2) == 1
-        and k.stride() == v.stride() and k.stride(3) == 1
-        and (k.data_ptr() & 15) == 0 and (v.data_ptr() & 15) == 0
-        and int(max_seqlen_k) <= _BT_MAX_TILES * 64
-    )
+    if head_size not in _SRC or not enabled(head_size):
+        return False
+    checks = {
+        "window": sliding_window == _WINDOW[head_size],
+        "gqa4": q.shape[1] == 4 * num_kv_heads,
+        "block64": block_size == 64,
+        "plain": not softcap and sinks is None and alibi_slopes is None and qq_bias is None and output_scale is None,
+        "dtypes": q.dtype == k.dtype == v.dtype and q.dtype.itemsize == 1 and out.dtype == torch.bfloat16,
+        "strides": q.stride(2) == 1 and out.stride(2) == 1 and k.stride() == v.stride() and k.stride(3) == 1,
+        "align": (k.data_ptr() & 15) == 0 and (v.data_ptr() & 15) == 0,
+        "seqlen": int(max_seqlen_k) <= _BT_MAX_TILES * 64,
+    }
+    ok = all(checks.values())
+    if not ok and os.environ.get("AITER_UA_HIP_DEBUG") and ("miss", head_size) not in _seen:
+        _seen.add(("miss", head_size))
+        print(f"[aiter] ua_hip_prefill: not used for head size {head_size}: {[n for n, c in checks.items() if not c]} "
+              f"window={sliding_window} sinks={sinks is not None} out_scale={output_scale is not None} "
+              f"qstride={q.stride()} kstride={k.stride()} vstride={v.stride()} ostride={out.stride()} k={tuple(k.shape)}", flush=True)
+    return ok
 
 
 def run(q, k, v, out, cu_seqlens_q, seqused_k, block_table, softmax_scale, q_descale, k_descale, v_descale):
