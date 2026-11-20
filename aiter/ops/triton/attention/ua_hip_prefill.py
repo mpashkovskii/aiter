@@ -21,6 +21,7 @@ _WINDOW = {512: 0, 256: 512}
 _FLAGS = ["-O3", "-w", "--offload-arch=gfx950", "-shared", "-fPIC"]
 _BT_MAX_TILES = 3424
 _libs = {}
+_seen = set()
 
 
 class _Args(ctypes.Structure):
@@ -92,6 +93,9 @@ def supported(q, k, v, out, num_kv_heads, block_size, head_size, softcap, sinks,
 
 def run(q, k, v, out, cu_seqlens_q, seqused_k, block_table, softmax_scale, q_descale, k_descale, v_descale):
     lib = _load(q.shape[2])
+    if q.shape[2] not in _seen:
+        _seen.add(q.shape[2])
+        print(f"[aiter] ua_hip_prefill: HIP fp8 prefill kernel in use for head size {q.shape[2]}", flush=True)
     ones = None
     keep = []
     ptrs = []
