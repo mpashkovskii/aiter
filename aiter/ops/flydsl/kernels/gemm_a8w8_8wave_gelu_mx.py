@@ -14,6 +14,8 @@ FP8 activation ``[M, N/2]`` and the E8M0 scales in the ``shuffle_scale_w4`` layo
 """
 
 import flydsl.compiler as flyc
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
@@ -73,7 +75,9 @@ class S2RLoader:
 
 class StoreActMX:
     """Fused epilogue: act = bf16(bf16(gelu_tanh(gate)) * up), quantized per (row, 32 hidden cols) to fp8 e4m3 with an
-    e8m0 (power-of-two, rounded up) scale. Writes fp8 [M, N/2] and e8m0 bytes [M, N/64]."""
+    e8m0 (power-of-two, rounded up) scale. Writes fp8 [M, N/2] and e8m0 bytes [M, N/64].
+    The 4 row tiles of a half are processed batched (independent chains interleave), the amax is exchanged with
+    permlane swaps (no LDS), the per-row / per-column scales are prefetched."""
 
     def __init__(self, A_scale, B_scale, C, SC, c_rows, c_cols, c_idx_fn, n_tiles_a):
         self.c_rows = c_rows
@@ -95,74 +99,91 @@ class StoreActMX:
         self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
         self.out_atom_8 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(NT_STORE), fx.Int8)
         self.sc_atom = fx.make_copy_atom(fx.rocdl.BufferCopy8b(), fx.Int8)
-        self.reg_f32_4 = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
-        self.reg_f32_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
-        self.reg_i8_8 = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.Int8)
-        self.reg_i8_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int8)
+        self.pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
+        self.pre = None
 
     def _sb_vec4(self, col):
-        fx.copy(self.scale_atom_4, fx.slice(self.sb_div, (None, fx.Int32(col))), self.reg_f32_4)
-        return Vec(fx.memref_load_vec(self.reg_f32_4))
+        r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
+        fx.copy(self.scale_atom_4, fx.slice(self.sb_div, (None, fx.Int32(col))), r)
+        return r
 
     def _sa_scalar(self, row):
-        fx.copy(self.scale_atom_1, fx.slice(self.sa_div, (None, fx.Int32(row))), self.reg_f32_1)
-        return Vec(fx.memref_load_vec(self.reg_f32_1))[0]
+        r = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
+        fx.copy(self.scale_atom_1, fx.slice(self.sa_div, (None, fx.Int32(row))), r)
+        return r
 
-    def _xor_max(self, v_i32, off):
-        src = (self.lane_id ^ fx.Int32(off)) * fx.Int32(4)
-        r = fx.Int32(rocdl.ds_bpermute(T.i32, src, v_i32))
-        return (r > v_i32).select(r, v_i32)
-
-    def store(self, c_gate, c_up, base_row, wcol0, hid_col0, sc_k1, sc_kp, sc_l0):
+    def prefetch(self, base_row, half_rows, wcol0):
+        """Issue the scale loads (per-row for both halves, per-column once) without using them yet."""
         l16 = self.lane_id % 16
-        sbg0 = self._sb_vec4(wcol0)
-        sbg1 = self._sb_vec4(wcol0 + 4)
-        sbu0 = self._sb_vec4(wcol0 + 128)
-        sbu1 = self._sb_vec4(wcol0 + 132)
-        es = []
-        K1 = fx.Float32(-2.0 * 1.4426950408889634 * 0.7978845608028654)
-        K2 = fx.Float32(-2.0 * 1.4426950408889634 * 0.7978845608028654 * 0.044715)
-        for ti in range_constexpr(self.n_tiles_a):
-            row = base_row + ti * 16 + l16
-            sa = Vec.filled(4, self._sa_scalar(row), fx.Float32)
-            g = (Vec(c_gate[self.c_idx_fn(ti, 0)]) * (sa * sbg0)).shuffle(Vec(c_gate[self.c_idx_fn(ti, 1)]) * (sa * sbg1), list(range(8)))
-            u = (Vec(c_up[self.c_idx_fn(ti, 0)]) * (sa * sbu0)).shuffle(Vec(c_up[self.c_idx_fn(ti, 1)]) * (sa * sbu1), list(range(8)))
-            t = g * g
-            z = g * (t * K2 + K1)
-            ee = [fx.Float32(rocdl.exp2(T.f32, _raw(z[i]))) for i in range_constexpr(8)]
-            d = Vec.from_elements(ee, dtype=fx.Float32) + fx.Float32(1.0)
-            rr = [fx.Float32(rocdl.rcp(T.f32, _raw(d[i]))) for i in range_constexpr(8)]
-            act = g * Vec.from_elements(rr, dtype=fx.Float32) * u
-            m = fx.max(act[0], -act[0])
-            for i in range_constexpr(1, 8):
-                m = fx.max(m, fx.max(act[i], -act[i]))
-            mi = Vec.filled(1, m, fx.Float32).bitcast(fx.Int32)[0]
-            mi = self._xor_max(mi, 16)
-            mi = self._xor_max(mi, 32)
-            rb = Vec.filled(1, Vec.filled(1, mi, fx.Int32).bitcast(fx.Float32)[0] * fx.Float32(1.0 / 448.0), fx.Float32).bitcast(fx.Int32)[0]
-            eb = (rb + fx.Int32(0x7FFFFF)) >> fx.Int32(23)
-            eb = (eb < fx.Int32(1)).select(fx.Int32(1), eb)
-            eb = (eb > fx.Int32(254)).select(fx.Int32(254), eb)
-            inv = Vec.filled(1, (fx.Int32(254) - eb) << fx.Int32(23), fx.Int32).bitcast(fx.Float32)[0]
-            q = act * inv
-            w = []
-            for p in range_constexpr(2):
-                lo = rocdl.cvt_pk_fp8_f32(T.i32, q[4 * p], q[4 * p + 1], fx.Int32(0), False)
-                w.append(rocdl.cvt_pk_fp8_f32(T.i32, q[4 * p + 2], q[4 * p + 3], lo, True))
-            packed = fx.Vector.from_elements([fx.Int32(x) for x in w], dtype=fx.Int32).bitcast(fx.Int8)
-            fx.memref_store_vec(packed, self.reg_i8_8)
-            c_index = row * self.out_cols + hid_col0
-            fx.copy(self.out_atom_8, self.reg_i8_8, fx.slice(self.c_div, (None, c_index)))
-            es.append(eb)
+        sa = [[self._sa_scalar(base_row + h * half_rows + ti * 16 + l16) for ti in range_constexpr(self.n_tiles_a)] for h in range_constexpr(2)]
+        sb = [self._sb_vec4(wcol0), self._sb_vec4(wcol0 + 4), self._sb_vec4(wcol0 + 128), self._sb_vec4(wcol0 + 132)]
+        self.pre = (sa, sb)
+
+    def _swap_max(self, v, fn):
+        sw = fn(self.pair_ty, _raw(v), _raw(v), False, False)
+        a = fx.Int32(llvm.extractvalue(T.i32, sw, [0]))
+        b = fx.Int32(llvm.extractvalue(T.i32, sw, [1]))
+        return (a > b).select(a, b)
+
+    def begin(self, half):
+        sa_regs, sb_regs = self.pre
+        self.sbg0, self.sbg1, self.sbu0, self.sbu1 = [Vec(fx.memref_load_vec(r)) for r in sb_regs]
+        self.K1v = Vec.filled(8, fx.Float32(-2.0 * 1.4426950408889634 * 0.7978845608028654), fx.Float32)
+        self.K2v = Vec.filled(8, fx.Float32(-2.0 * 1.4426950408889634 * 0.7978845608028654 * 0.044715), fx.Float32)
+        self.one = Vec.filled(8, fx.Float32(1.0), fx.Float32)
+        self.es = [None] * self.n_tiles_a
+
+    def epi_one(self, ti, c_gate, c_up, half, base_row, hid_col0):
+        l16 = self.lane_id % 16
+        sa_regs, _ = self.pre
+        sbg0, sbg1, sbu0, sbu1 = self.sbg0, self.sbg1, self.sbu0, self.sbu1
+        sa = Vec.filled(4, Vec(fx.memref_load_vec(sa_regs[half][ti]))[0], fx.Float32)
+        g = (Vec(c_gate[self.c_idx_fn(ti, 0)]) * (sa * sbg0)).shuffle(Vec(c_gate[self.c_idx_fn(ti, 1)]) * (sa * sbg1), list(range(8)))
+        u = (Vec(c_up[self.c_idx_fn(ti, 0)]) * (sa * sbu0)).shuffle(Vec(c_up[self.c_idx_fn(ti, 1)]) * (sa * sbu1), list(range(8)))
+        z = g * fx.fma(g * g, self.K2v, self.K1v)
+        ee = [fx.Float32(rocdl.exp2(T.f32, _raw(z[i]))) for i in range_constexpr(8)]
+        d = Vec.from_elements(ee, dtype=fx.Float32) + self.one
+        rr = [fx.Float32(rocdl.rcp(T.f32, _raw(d[i]))) for i in range_constexpr(8)]
+        act = g * Vec.from_elements(rr, dtype=fx.Float32) * u
+        m = fx.max(act[0], -act[0])
+        for i in range_constexpr(1, 8):
+            m = fx.max(m, fx.max(act[i], -act[i]))
+        mi = Vec.filled(1, m, fx.Float32).bitcast(fx.Int32)[0]
+        mi = self._swap_max(mi, rocdl.permlane16_swap)
+        mi = self._swap_max(mi, rocdl.permlane32_swap)
+        rb = Vec.filled(1, Vec.filled(1, mi, fx.Int32).bitcast(fx.Float32)[0] * fx.Float32(1.0 / 448.0), fx.Float32).bitcast(fx.Int32)[0]
+        eb = (rb + fx.Int32(0x7FFFFF)) >> fx.Int32(23)
+        eb = (eb < fx.Int32(1)).select(fx.Int32(1), eb)
+        eb = (eb > fx.Int32(254)).select(fx.Int32(254), eb)
+        sc_f = Vec.filled(1, eb << fx.Int32(23), fx.Int32).bitcast(fx.Float32)[0]
+        v2i16 = ir.VectorType.get([2], ir.IntegerType.get_signless(16))
+        zero2 = Vec.filled(2, 0, fx.Int16)
+        r01 = rocdl.cvt_scalef32_pk_fp8_f32(v2i16, _raw(zero2), _raw(act[0]), _raw(act[1]), _raw(sc_f), False)
+        r01 = rocdl.cvt_scalef32_pk_fp8_f32(v2i16, r01, _raw(act[2]), _raw(act[3]), _raw(sc_f), True)
+        r23 = rocdl.cvt_scalef32_pk_fp8_f32(v2i16, _raw(zero2), _raw(act[4]), _raw(act[5]), _raw(sc_f), False)
+        r23 = rocdl.cvt_scalef32_pk_fp8_f32(v2i16, r23, _raw(act[6]), _raw(act[7]), _raw(sc_f), True)
+        w = [Vec(r01).bitcast(fx.Int32)[0], Vec(r23).bitcast(fx.Int32)[0]]
+        packed = fx.Vector.from_elements([fx.Int32(x) for x in w], dtype=fx.Int32).bitcast(fx.Int8)
+        reg8 = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.Int8)
+        fx.memref_store_vec(packed, reg8)
+        row = base_row + ti * 16 + l16
+        c_index = row * self.out_cols + hid_col0
+        fx.copy(self.out_atom_8, reg8, fx.slice(self.c_div, (None, c_index)))
+        self.es[ti] = eb
+
+    def epi_scales(self, base_row, sc_k1, sc_kp, sc_l0):
+        l16 = self.lane_id % 16
+        es = self.es
         grp = self.lane_id // 16
         sel = es[0]
         for ti in range_constexpr(1, self.n_tiles_a):
             sel = (grp == fx.Int32(ti)).select(es[ti], sel)
         sel8 = Vec.filled(1, fx.Int32(sel), fx.Int32).bitcast(fx.Int8)
-        fx.memref_store_vec(Vec.from_elements([sel8[0]], dtype=fx.Int8), self.reg_i8_1)
+        reg1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int8)
+        fx.memref_store_vec(Vec.from_elements([sel8[0]], dtype=fx.Int8), reg1)
         n1 = base_row // 32 + grp // 2
         sc_i = ((n1 * self.k1_stride + sc_k1) * 64 + sc_l0 + l16) * 4 + sc_kp * 2 + (grp % 2)
-        fx.copy(self.sc_atom, self.reg_i8_1, fx.slice(self.sc_div, (None, sc_i)))
+        fx.copy(self.sc_atom, reg1, fx.slice(self.sc_div, (None, sc_i)))
 
 
 class Mfma16x16x128:
@@ -223,13 +244,18 @@ class Mfma16x16x128:
             for idx in range_constexpr(self.n_tiles_a * self.n_tiles_b)
         ]
 
+    def one(self, a, b, c, i, j):
+        af = self._make_operand_frag(a[i]); bf = self._make_operand_frag(b[j]); cf = self._make_accum_frag(c[self.idx(i, j)])
+        fx.gemm(self.atom, cf, bf, af, cf)
+        return cf.load().ir_value()
+
     def call_one(self, a, b, c, i, j):
         assert i < self.n_tiles_a and j < self.n_tiles_b
 
         return self._do_mma(a[i], b[j], c[self.idx(i, j)])
 
 
-NT_STORE = 2  # buffer cache policy bit "nt": streaming stores
+NT_STORE = 0  # plain (cached) stores: the streaming nt policy was 30 us slower per gate_up call  # buffer cache policy bit "nt": streaming stores
 
 
 def compile_fp8_gemm_8w_gelu_mx(
@@ -448,17 +474,34 @@ def compile_fp8_gemm_8w_gelu_mx(
         rocdl.s_barrier()
 
         c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+        store_c.prefetch(base_row, LDS_BLOCK_M, wcol0)
         a1_frag = a_s2r.load(a_cur1)
         rocdl.s_barrier()
 
-        rocdl.s_setprio(1)
-        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, set_prio=False)
-        store_c.store(c00_frag, c01_frag, base_row + 0, wcol0, hid0, sck1, sckp, scl0)
-        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, set_prio=False)
-        rocdl.s_setprio(0)
+        # Row tile ti of the first half is epilogued while the remaining c10/c11 MFMAs of the
+        # last K step run; the second half follows the closing barrier.
+        store_c.begin(0)
+        c10 = list(c10_frag)
+        c11 = list(c11_frag)
+
+        def mfma_row(c, b_frag, ti):
+            for j in range_constexpr(mfma.n_tiles_b):
+                c[mfma.idx(ti, j)] = mfma.one(a1_frag, b_frag, c, ti, j)
+
+        for ti in range_constexpr(N_TILES_A):
+            mfma_row(c10, b0_frag, ti)
+        store_c.epi_one(0, c00_frag, c01_frag, 0, base_row + 0, hid0)
+        for ti in range_constexpr(N_TILES_A):
+            mfma_row(c11, b1_frag, ti)
+        for ti in range_constexpr(1, N_TILES_A):
+            store_c.epi_one(ti, c00_frag, c01_frag, 0, base_row + 0, hid0)
+        store_c.epi_scales(base_row + 0, sck1, sckp, scl0)
         rocdl.s_barrier()
 
-        store_c.store(c10_frag, c11_frag, base_row + LDS_BLOCK_M, wcol0, hid0, sck1, sckp, scl0)
+        store_c.begin(1)
+        for ti in range_constexpr(N_TILES_A):
+            store_c.epi_one(ti, c10, c11, 1, base_row + LDS_BLOCK_M, hid0)
+        store_c.epi_scales(base_row + LDS_BLOCK_M, sck1, sckp, scl0)
 
     @flyc.jit
     def launch_gemm(
