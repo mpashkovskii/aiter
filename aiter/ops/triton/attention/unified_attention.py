@@ -124,6 +124,24 @@ class _UAParams(NamedTuple):
     skip_reduce: bool = False
 
 
+# Smallest prefill (query tokens) that takes the gluon 2D kernel at head size 512. Below it the
+# programs are too few to fill the CUs and the 2D Triton kernel stays (a 128-row tile over a long
+# cached context: 256 tokens over 8k took 351 us in gluon vs 211 us for Triton at BLOCK_M 16).
+_GFX950_GLUON_HD512_MIN_TOKENS = 768
+
+
+def _gfx950_gluon_prefill_hd512(params: _UAParams):
+    """fp8 prefill at head size 512 (no sliding window): the software-pipelined gluon 2D loop
+    is ~12% faster than the Triton 2D kernel, whose 256-register accumulator spills."""
+    return (
+        params.head_size == 512
+        and not params.all_decode
+        and params.sliding_window == 0
+        and params.q_dtype == e4m3_dtype
+        and params.num_tokens >= _GFX950_GLUON_HD512_MIN_TOKENS
+    )
+
+
 def _gfx950_gluon_supported(params: _UAParams):
     """GFX950 Gluon supported configs."""
     if params.shuffled_kv_cache and (
@@ -139,7 +157,7 @@ def _gfx950_gluon_supported(params: _UAParams):
         and not params.softcap
         and not params.use_qq_bias
         and not params.use_alibi_slopes
-        and params.head_size <= 256
+        and (params.head_size <= 256 or _gfx950_gluon_prefill_hd512(params))
         and triton.next_power_of_2(params.head_size) == params.head_size
         and params.head_size_v == params.head_size
         and params.q_dtype in (e4m3_dtype, torch.bfloat16)
@@ -162,7 +180,7 @@ def _gfx950_split_grid(params: _UAParams):
     """Decode, and batches too small to fill the GPU, take the split grid."""
     if params.all_decode:
         return True
-    if params.sliding_window > 0:
+    if params.sliding_window > 0 or params.head_size > 256:
         return False
     # unsplit, the 2d grid is faster
     config = get_unified_attention_config(
