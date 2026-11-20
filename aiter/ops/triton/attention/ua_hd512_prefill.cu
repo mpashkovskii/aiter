@@ -56,6 +56,7 @@ struct UAArgs {
   int bt_stride;
   int num_seqs;
   float scale;
+  int blk_shift;   // log2(page tokens / 64)
 };
 
 #ifndef HDV
@@ -167,7 +168,7 @@ struct Kern {
 #ifdef ABL_NOLOAD
     if (blk != -12345) return;
 #endif
-    const uint8_t* gp = (is_k ? a.kc : a.vc) + (long long)blk * a.kv_s_blk + ldoff + (long long)(RPI * i) * tokstride;
+    const uint8_t* gp = (is_k ? a.kc : a.vc) + (long long)(blk >> a.blk_shift) * a.kv_s_blk + (long long)(blk & ((1 << a.blk_shift) - 1)) * (64 * a.kv_s_tok) + ldoff + (long long)(RPI * i) * tokstride;
     gp += (unsigned)(is_k ? voffK[i & 3] : voffV[i & 3]);
     if (is_k)
       __builtin_amdgcn_global_load_lds((void*)gp, (lds_void*)(Ksm + stage * KST + (16 * wave + RPI * i) * HD), 16, 0, 0);
@@ -338,8 +339,9 @@ __global__ __launch_bounds__(256, MINBLK) void ua512_v7(UAArgs a) {
   const bool row_valid = tok_local < qlen;
   k.qpos = ctx + tok_local;
   const int* bt_g = a.block_table + (long long)seq * a.bt_stride;
+#define TILE_CODE(AB) ((bt_g[(AB) >> a.blk_shift] << a.blk_shift) | ((AB) & ((1 << a.blk_shift) - 1)))
   int* const btl = (int*)(Xsm + X_BT);
-  for (int i = tid; i < nt; i += 256) btl[i] = bt_g[t0 + i];
+  for (int i = tid; i < nt; i += 256) btl[i] = TILE_CODE(t0 + i);
   k.ldoff = (long long)kv_head * a.kv_s_head;
   k.tokstride = a.kv_s_tok;
   {
@@ -441,8 +443,8 @@ __global__ __launch_bounds__(256, MINBLK) void ua512_v7(UAArgs a) {
   v8i dbgP = {0,0,0,0,0,0,0,0}; v8i dbgV = dbgP; float dbgS = 0, dbgA = 0, dbgE0 = 0, dbgE1 = 0, dbgE2 = 0;
 #endif
   {
-    const int b0 = bt_g[t0];
-    const int b1 = bt_g[t0 + min(1, nt - 1)];
+    const int b0 = TILE_CODE(t0);
+    const int b1 = TILE_CODE(t0 + min(1, nt - 1));
 #pragma unroll
     for (int i = 0; i < NCP; i++) k.issue_one(true, b0, 0, i);
 #pragma unroll
@@ -479,7 +481,7 @@ __global__ __launch_bounds__(256, MINBLK) void ua512_v7(UAArgs a) {
   // K_2 into stage 0 once every wave is done reading K_0
   asm volatile("s_waitcnt lgkmcnt(0)\n s_barrier" ::: "memory");
   {
-    const int b2 = bt_g[t0 + min(2, nt - 1)];
+    const int b2 = TILE_CODE(t0 + min(2, nt - 1));
 #pragma unroll
     for (int i = 0; i < NCP; i++) k.issue_one(true, b2, 0, i);
   }

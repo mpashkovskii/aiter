@@ -1,4 +1,4 @@
-"""HIP fp8 prefill kernels for gfx950 (GQA 4, 64-token pages, no softcap, sinks or alibi):
+"""HIP fp8 prefill kernels for gfx950 (GQA 4, 64- or 128-token pages, no softcap, sinks or alibi):
 head size 512 without a window and head size 256 with a 512-token sliding window.
 
 The sources (ua_hd512_prefill.cu, ua_hd256_w512_prefill.cu, both generated from one template) are
@@ -31,7 +31,7 @@ class _Args(ctypes.Structure):
         ("q_descale", ctypes.c_void_p), ("k_descale", ctypes.c_void_p), ("v_descale", ctypes.c_void_p),
         ("q_s0", ctypes.c_longlong), ("q_s1", ctypes.c_longlong), ("o_s0", ctypes.c_longlong), ("o_s1", ctypes.c_longlong),
         ("kv_s_blk", ctypes.c_longlong), ("kv_s_tok", ctypes.c_longlong), ("kv_s_head", ctypes.c_longlong),
-        ("bt_stride", ctypes.c_int), ("num_seqs", ctypes.c_int), ("scale", ctypes.c_float),
+        ("bt_stride", ctypes.c_int), ("num_seqs", ctypes.c_int), ("scale", ctypes.c_float), ("blk_shift", ctypes.c_int),
     ]
 
 
@@ -75,7 +75,7 @@ def supported(q, k, v, out, num_kv_heads, block_size, head_size, softcap, sinks,
     checks = {
         "window": sliding_window == _WINDOW[head_size],
         "gqa4": q.shape[1] == 4 * num_kv_heads,
-        "block64": block_size == 64,
+        "page": block_size in (64, 128),
         "plain": not softcap and sinks is None and alibi_slopes is None and qq_bias is None and output_scale is None,
         "dtypes": q.dtype == k.dtype == v.dtype and q.dtype.itemsize == 1 and out.dtype == torch.bfloat16,
         "strides": q.stride(2) == 1 and out.stride(2) == 1 and k.stride() == v.stride() and k.stride(3) == 1,
@@ -120,6 +120,7 @@ def run(q, k, v, out, cu_seqlens_q, seqused_k, block_table, softmax_scale, q_des
     num_seqs = seqused_k.shape[0]
     a.num_seqs = num_seqs
     a.scale = float(softmax_scale)
+    a.blk_shift = (k.shape[1] // 64).bit_length() - 1
     nqb = q.shape[0] // 32 + num_seqs
     r = lib.ua512_launch(ctypes.byref(a), nqb, k.shape[2], ctypes.c_void_p(torch.cuda.current_stream().cuda_stream), 1)
     if r != 0:
