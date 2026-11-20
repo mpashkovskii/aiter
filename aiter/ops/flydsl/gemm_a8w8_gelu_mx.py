@@ -127,7 +127,7 @@ def flydsl_gate_up_gelu_mx(
     out_scale: Tensor,
     *,
     waves_per_eu: int = 3,
-    xcd_swizzle: int = 4,
+    xcd_swizzle: int = 2,
 ) -> None:
     """XQ ``[M, K]`` fp8; W the ``prepare_gate_up_weight`` weight ``[N, K]``; x_scale per-token fp32 ``[M]`` / ``[M, 1]``;
     w_scale the interleaved fp32 ``[N]``. Writes ``out`` ``[M, N/2]`` fp8 and ``out_scale`` (flat uint8 E8M0 in the
@@ -163,7 +163,7 @@ def flydsl_mx_down(
     out: Tensor,
     *,
     waves_per_eu: int = 3,
-    xcd_swizzle: int = 4,
+    xcd_swizzle: int = 2,
 ) -> None:
     """XQ ``[M, K]`` fp8 with flat ``shuffle_scale_w4`` E8M0 ``x_scale``; W ``[N, K]`` 16x16 pre-shuffled fp8;
     ``w_unit_scale`` ``scale_numel(N, K)`` uint8 filled with 127 (2**0); ``w_chan_scale`` fp32 ``[N]``; out ``[M, N]`` bf16."""
