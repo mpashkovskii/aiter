@@ -1,9 +1,9 @@
-"""HIP fp8 prefill kernels for gfx950 (GQA 4, 64- or 128-token pages, no softcap, sinks or alibi):
-head size 512 without a window and head size 256 with a 512-token sliding window.
+"""HIP fp8 prefill kernel for gfx950 at head size 512 (no sliding window, GQA 4, 64- or 128-token
+pages, no softcap, sinks or alibi).
 
-The sources (ua_hd512_prefill.cu, ua_hd256_w512_prefill.cu, both generated from one template) are
-compiled with hipcc on first use into a per-user cache and launched through ctypes on the current
-torch stream. Switches: AITER_UA_HD512_HIP and AITER_UA_HD256_HIP (default 1).
+The source (ua_hd512_prefill.cu) is compiled with hipcc on first use into a per-user cache and
+launched through ctypes on the current torch stream. Switch: AITER_UA_HD512_HIP (default 1);
+AITER_UA_HIP_DEBUG=1 prints why a call falls back to the gluon kernel.
 """
 import ctypes
 import fcntl
@@ -14,14 +14,11 @@ import subprocess
 
 import torch
 
-_DIR = os.path.dirname(os.path.abspath(__file__))
-_SRC = {512: os.path.join(_DIR, "ua_hd512_prefill.cu"), 256: os.path.join(_DIR, "ua_hd256_w512_prefill.cu")}
-_ENV = {512: "AITER_UA_HD512_HIP", 256: "AITER_UA_HD256_HIP"}
-_WINDOW = {512: 0, 256: 512}
+_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ua_hd512_prefill.cu")
 _FLAGS = ["-O3", "-w", "--offload-arch=gfx950", "-shared", "-fPIC"]
 _BT_MAX_TILES = 3424
-_libs = {}
-_seen = set()
+_lib = None
+_logged = set()
 
 
 class _Args(ctypes.Structure):
@@ -35,19 +32,12 @@ class _Args(ctypes.Structure):
     ]
 
 
-def enabled(head_size) -> bool:
-    if os.path.exists(f"/tmp/aiter_ua_off_{head_size}"):   # EXPERIMENT-ONLY toggle, removed before the final commit
-        return False
-    return os.environ.get(_ENV[head_size], "1") != "0"
-
-
-def _build(head_size):
-    src_path = _SRC[head_size]
-    src = open(src_path, "rb").read()
+def _build():
+    src = open(_SRC, "rb").read()
     tag = hashlib.sha1(src + " ".join(_FLAGS).encode()).hexdigest()[:16]
-    cache = os.path.join(os.environ.get("AITER_UA512_CACHE", os.path.expanduser("~/.cache/aiter_ua512")))
+    cache = os.environ.get("AITER_UA512_CACHE", os.path.expanduser("~/.cache/aiter_ua512"))
     os.makedirs(cache, exist_ok=True)
-    so = os.path.join(cache, f"ua_hd{head_size}_{tag}.so")
+    so = os.path.join(cache, f"ua_hd512_{tag}.so")
     if os.path.exists(so):
         return so
     with open(os.path.join(cache, f"{tag}.lock"), "w") as lk:
@@ -55,27 +45,27 @@ def _build(head_size):
         if not os.path.exists(so):
             hipcc = shutil.which("hipcc") or "/opt/rocm/bin/hipcc"
             tmp = f"{so}.{os.getpid()}.tmp"
-            subprocess.run([hipcc, *_FLAGS, "-o", tmp, src_path], check=True, capture_output=True)
+            subprocess.run([hipcc, *_FLAGS, "-o", tmp, _SRC], check=True, capture_output=True)
             os.replace(tmp, so)
     return so
 
 
-def _load(head_size):
-    lib = _libs.get(head_size)
-    if lib is None:
-        lib = ctypes.CDLL(_build(head_size))
+def _load():
+    global _lib
+    if _lib is None:
+        lib = ctypes.CDLL(_build())
         lib.ua512_launch.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
         lib.ua512_launch.restype = ctypes.c_int
-        _libs[head_size] = lib
-    return lib
+        _lib = lib
+    return _lib
 
 
 def supported(q, k, v, out, num_kv_heads, block_size, head_size, softcap, sinks, alibi_slopes, qq_bias,
               output_scale, sliding_window, max_seqlen_k) -> bool:
-    if head_size not in _SRC or not enabled(head_size):
+    if head_size != 512 or os.environ.get("AITER_UA_HD512_HIP", "1") == "0":
         return False
     checks = {
-        "window": sliding_window == _WINDOW[head_size],
+        "window": sliding_window == 0,
         "gqa4": q.shape[1] == 4 * num_kv_heads,
         "page": block_size in (64, 128),
         "plain": not softcap and sinks is None and alibi_slopes is None and qq_bias is None and output_scale is None,
@@ -85,19 +75,18 @@ def supported(q, k, v, out, num_kv_heads, block_size, head_size, softcap, sinks,
         "seqlen": int(max_seqlen_k) <= _BT_MAX_TILES * 64,
     }
     ok = all(checks.values())
-    if not ok and os.environ.get("AITER_UA_HIP_DEBUG") and ("miss", head_size) not in _seen:
-        _seen.add(("miss", head_size))
-        print(f"[aiter] ua_hip_prefill: not used for head size {head_size}: {[n for n, c in checks.items() if not c]} "
-              f"window={sliding_window} sinks={sinks is not None} out_scale={output_scale is not None} "
-              f"qstride={q.stride()} kstride={k.stride()} vstride={v.stride()} ostride={out.stride()} k={tuple(k.shape)}", flush=True)
+    if not ok and os.environ.get("AITER_UA_HIP_DEBUG") and "miss" not in _logged:
+        _logged.add("miss")
+        print(f"[aiter] ua_hip_prefill: not used for head size 512: {[n for n, c in checks.items() if not c]} "
+              f"window={sliding_window} kstride={k.stride()} k={tuple(k.shape)}", flush=True)
     return ok
 
 
 def run(q, k, v, out, cu_seqlens_q, seqused_k, block_table, softmax_scale, q_descale, k_descale, v_descale):
-    lib = _load(q.shape[2])
-    if q.shape[2] not in _seen:
-        _seen.add(q.shape[2])
-        print(f"[aiter] ua_hip_prefill: HIP fp8 prefill kernel in use for head size {q.shape[2]}", flush=True)
+    lib = _load()
+    if "use" not in _logged:
+        _logged.add("use")
+        print("[aiter] ua_hip_prefill: HIP fp8 prefill kernel in use for head size 512", flush=True)
     ones = None
     keep = []
     ptrs = []

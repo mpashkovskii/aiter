@@ -1,6 +1,5 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
-import os
 from typing import NamedTuple
 
 import torch
@@ -15,7 +14,7 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arc
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.types import e4m3_dtype
-from aiter.ops.triton.attention import ua_hip_prefill as _ua512_hip
+from aiter.ops.triton.attention import ua_hip_prefill as _ua_hip_prefill
 from aiter.ops.triton.utils.unified_attention_utils import (
     get_dtype_str,
     get_unified_attention_config,
@@ -130,10 +129,7 @@ class _UAParams(NamedTuple):
 # programs are too few to fill the CUs and the 2D Triton kernel stays (a 128-row tile over a long
 # cached context: 256 tokens over 8k took 351 us in gluon vs 211 us for Triton at BLOCK_M 16).
 _GFX950_GLUON_HD512_MIN_TOKENS = 768
-_UA_HIP_MIN_TOKENS = {
-    512: _GFX950_GLUON_HD512_MIN_TOKENS,
-    256: int(os.environ.get("AITER_UA_HD256_MIN_TOKENS", "1")),
-}
+_UA_HIP_MIN_TOKENS = {512: _GFX950_GLUON_HD512_MIN_TOKENS}
 
 
 def _gfx950_gluon_prefill_hd512(params: _UAParams):
@@ -400,7 +396,7 @@ def unified_attention(
         skip_reduce=skip_reduce,
     )
 
-    # gfx950 fp8 prefill at hd512 and hd256 sliding: hand-scheduled HIP kernels (column-split PV,
+    # gfx950 fp8 prefill at hd512 (no window): hand-scheduled HIP kernel (column-split PV,
     # E8M0-scaled fp8 P), see ua_hip_prefill.py
     if (
         DEVICE_ARCH == "gfx950"
@@ -408,12 +404,12 @@ def unified_attention(
         and params.num_tokens >= _UA_HIP_MIN_TOKENS.get(head_size, 1 << 30)
         and q_dtype == e4m3_dtype
         and not shuffled_kv_cache
-        and _ua512_hip.supported(
+        and _ua_hip_prefill.supported(
             q, k, v, out, num_kv_heads, block_size, head_size, softcap, sinks,
             alibi_slopes, qq_bias, output_scale, SLIDING_WINDOW, max_seqlen_k,
         )
     ):
-        return _ua512_hip.run(
+        return _ua_hip_prefill.run(
             q, k, v, out, cu_seqlens_q, seqused_k, block_table, softmax_scale,
             q_descale, k_descale, v_descale,
         )
@@ -1220,33 +1216,3 @@ def _unified_attention_3d_gfx950(
         partial_m=segm_max if split else None,
         partial_l=segm_expsum if split else None,
     )
-
-
-# EXPERIMENT-ONLY in-server timing of prefill calls (removed before the final commit)
-if os.environ.get("AITER_UA_TIMING"):
-    import collections as _collections
-
-    _orig_unified_attention = unified_attention
-    _tim_pending = []
-    _tim_stats = _collections.defaultdict(lambda: [0, 0.0])
-
-    def unified_attention(*args, **kwargs):  # noqa: F811
-        q = kwargs.get("q", args[0] if args else None)
-        if int(kwargs.get("max_seqlen_q", 1)) <= 1 or q.shape[0] < 8192:
-            return _orig_unified_attention(*args, **kwargs)
-        hd = q.shape[2]
-        hip = _ua512_hip.enabled(hd)
-        s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        s.record()
-        r = _orig_unified_attention(*args, **kwargs)
-        e.record()
-        _tim_pending.append(((hd, hip), s, e))
-        if len(_tim_pending) >= 1500:
-            torch.cuda.synchronize()
-            for key, s_, e_ in _tim_pending:
-                st = _tim_stats[key]
-                st[0] += 1
-                st[1] += s_.elapsed_time(e_) * 1000.0
-            _tim_pending.clear()
-            print("[aiter] UA_TIMING " + " ".join(f"hd{k[0]}/hip={int(k[1])}: n={v[0]} mean {v[1] / v[0]:.1f} us" for k, v in sorted(_tim_stats.items())), flush=True)
-        return r
