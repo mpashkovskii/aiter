@@ -1,5 +1,6 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import os
 from typing import NamedTuple
 
 import torch
@@ -1216,3 +1217,33 @@ def _unified_attention_3d_gfx950(
         partial_m=segm_max if split else None,
         partial_l=segm_expsum if split else None,
     )
+
+
+# EXPERIMENT-ONLY in-server timing of prefill calls (removed before the final commit)
+if os.environ.get("AITER_UA_TIMING"):
+    import collections as _collections
+
+    _orig_unified_attention = unified_attention
+    _tim_pending = []
+    _tim_stats = _collections.defaultdict(lambda: [0, 0.0])
+
+    def unified_attention(*args, **kwargs):  # noqa: F811
+        q = kwargs.get("q", args[0] if args else None)
+        if int(kwargs.get("max_seqlen_q", 1)) <= 1 or q.shape[0] < 8192:
+            return _orig_unified_attention(*args, **kwargs)
+        hd = q.shape[2]
+        hip = os.environ.get("AITER_UA_HD512_HIP", "1") != "0"
+        s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        s.record()
+        r = _orig_unified_attention(*args, **kwargs)
+        e.record()
+        _tim_pending.append(((hd, hip), s, e))
+        if len(_tim_pending) >= 1500:
+            torch.cuda.synchronize()
+            for key, s_, e_ in _tim_pending:
+                st = _tim_stats[key]
+                st[0] += 1
+                st[1] += s_.elapsed_time(e_) * 1000.0
+            _tim_pending.clear()
+            print("[aiter] UA_TIMING " + " ".join(f"hd{k[0]}/hip={int(k[1])}: n={v[0]} mean {v[1] / v[0]:.1f} us" for k, v in sorted(_tim_stats.items())), flush=True)
+        return r

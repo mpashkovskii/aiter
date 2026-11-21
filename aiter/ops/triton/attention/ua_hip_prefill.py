@@ -14,7 +14,7 @@ import subprocess
 
 import torch
 
-_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ua_hd512_prefill.cu")
+_SRC = os.environ.get("AITER_UA512_SRC_EXPERIMENT") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "ua_hd512_prefill.cu")  # EXPERIMENT-ONLY override
 _FLAGS = ["-O3", "-w", "--offload-arch=gfx950", "-shared", "-fPIC"]
 _BT_MAX_TILES = 3424
 _lib = None
