@@ -36,6 +36,8 @@ class _Args(ctypes.Structure):
 
 
 def enabled(head_size) -> bool:
+    if os.path.exists(f"/tmp/aiter_ua_off_{head_size}"):   # EXPERIMENT-ONLY toggle, removed before the final commit
+        return False
     return os.environ.get(_ENV[head_size], "1") != "0"
 
 
