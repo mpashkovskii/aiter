@@ -108,12 +108,18 @@ def requant_a_to_fp8(x_bf16, k_true):
 
     Prototype host version (torch ops); the production server path uses a fused
     kernel. Per-row amax over the true K columns.
+
+    Scaled to +-240, NOT the e4m3fnuz max of 448: this torch build's
+    ``.to(torch.float8_e4m3fnuz)`` cast overflows to NaN above ~248 (it applies
+    e4m3fn saturating-NaN semantics, measured iter-10 on ROCm). 240 keeps every
+    rounded value inside the cast's working range; the scale is fp32 so no
+    dynamic range is lost, only <1 bit of the fp8 exponent vs scaling to 448.
     """
     import torch
 
     x = x_bf16[:, :k_true].float()
     amax = x.abs().amax(dim=-1).clamp(min=1e-12)
-    s_a = amax / 448.0
+    s_a = amax / 240.0
     a8 = (x / s_a[:, None]).to(torch.float8_e4m3fnuz)
     return a8.contiguous(), s_a.contiguous()
 

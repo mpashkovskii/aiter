@@ -51,13 +51,14 @@ from .utils import (
 )
 
 # fp8 (e4m3fnuz) = 1 byte; the MFMA K=32 fp8 fragment per lane = 8 fp8 = 2 dwords.
-FP8 = T.Float8E4M3FNUZ
+# Passed as an i32-typed rmem frag (same pattern as gemm_a8w8_8wave's fp8 MFMA).
+FP8 = fx.Float8E4M3FNUZ
 
 
 def _fp8_frag8(v2i32):
-    """Pack 2 i32 as the (8,1) fp8 fragment tensor fx.gemm expects."""
-    t = fx.make_rmem_tensor(fx.make_layout(8, 1), FP8)
-    t.store(fx.Vector.from_elements([_raw(v2i32[0]), _raw(v2i32[1])], fx.Int32).bitcast(FP8))
+    """Pack 2 i32 (8 fp8) as the operand fragment tensor fx.gemm expects."""
+    t = fx.make_rmem_tensor(fx.make_layout(2, 1), fx.Int32)
+    t.store(Vec.from_elements([_raw(v2i32[0]), _raw(v2i32[1])], fx.Int32))
     return t
 
 
@@ -69,6 +70,7 @@ def _atomic_bf16_epilog_ws(
     arg_stids,
     arg_sweights,
     arg_swcol,
+    e_x_N_out,
     m_row,
     n_block_idx,
     wave,
@@ -82,7 +84,8 @@ def _atomic_bf16_epilog_ws(
 
     acc (f32) -> x s_w[col] -> bf16 -> LDS -> pairs x combined weight
     (gammas * s_a[row], host-side) -> global_bf16 atomic add.
-    Per-column scale: fp32 at swcol[n_block_idx*BN + col].
+    Per-column scale: fp32 at swcol[e*N_OUT + n_block_idx*BN + col]
+    (``e_x_N_out`` = e * N_OUT, precomputed by the caller).
     """
     _kMChunks = BM // 16
     M_REPS = BM // 8
@@ -123,7 +126,7 @@ def _atomic_bf16_epilog_ws(
         packed.append(load_scalar(load_i32, stids, sorted_pos, fx.Int32))
         weight.append(load_scalar(load_f32, sweights, sorted_pos, fx.Float32))
 
-    col_base = n_block_idx * fx.Int32(BN) + wave * fx.Int32(_n_per_wave) + lane_mod_16
+    col_base = e_x_N_out + n_block_idx * fx.Int32(BN) + wave * fx.Int32(_n_per_wave) + lane_mod_16
     for i in range_constexpr(_kMChunks):
         row_base = fx.Int32(i * 16) + lane_div_16 * fx.Int32(4)
         for J in range_constexpr(num_acc_n):
@@ -415,6 +418,7 @@ def _gemm2_body_a8w4(
         arg_stids,
         arg_sweights,
         arg_swcol,
+        e * fx.Int32(N_OUT),
         m_row,
         n_block_idx,
         wave,
