@@ -38,3 +38,7 @@ gfx950,128,16384,6144,2560,False,torch.bfloat16,torch.bfloat16,False,False,hipbl
 gfx950,128,16384,10752,2560,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,19108,0,1742.1,,0.0,517.73,0.28
 gfx950,128,16384,20480,2560,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,19108,0,3296.0,,0.0,521.23,0.26
 gfx950,128,16384,2560,256,False,torch.bfloat16,torch.bfloat16,False,False,hipblaslt,19060,0,69.5,,0.0,308.99,1.35
+gfx950,128,8320,3072,2560,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,238.1,,0.0,549.61,0.46
+gfx950,128,8448,3072,2560,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,240.2,,0.0,553.19,0.46
+gfx950,128,8576,3072,2560,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,269.4,,0.0,500.70,0.42
+gfx950,128,8704,3072,2560,False,torch.bfloat16,torch.bfloat16,False,False,torch,0,0,271.8,,0.0,503.69,0.42
