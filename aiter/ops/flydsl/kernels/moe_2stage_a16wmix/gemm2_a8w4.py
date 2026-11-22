@@ -587,8 +587,6 @@ def _gemm2_body_a8w4(
                 b_cur = b_nxt
     elif const_expr(K_TILES_TOTAL == 1):
         store_a_tile(0, 0)
-    elif const_expr(K_TILES_TOTAL == 1):
-        store_a_tile(0, 0)
         b0 = load_b_tile(0)
         gpu.barrier()
         compute_tile(b0, preload_a(0))
