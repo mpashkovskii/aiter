@@ -172,7 +172,7 @@
       "WIDE_BLOCK_M_MULT": 2
     },
     "D_GEQ_256": {
-      "BLOCK_M": 16,
+      "BLOCK_M": 32,
       "MFMA_DIM": 16,
       "NUM_BUFFERS": 2,
       "waves_per_eu": 1,
