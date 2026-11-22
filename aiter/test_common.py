@@ -79,7 +79,14 @@ def perftest(
             ] + [(args, kwargs)]
             run_iters(num_warmup, func, *args, **kwargs)
             torch.cuda.synchronize()
-            if int(os.environ.get("AITER_LOG_MORE", "0")) or use_cuda_event:
+            # AITER_PERFTEST_CUDA_EVENT=1 forces CUDA-event timing: on some nodes
+            # (e.g. gfx942 8-GPU) torch.profiler inside mp_tuner worker children
+            # records no CUDA events and every run_perftest returns us=0, making
+            # the tuners write empty CSVs.
+            cu_event = use_cuda_event or int(
+                os.environ.get("AITER_PERFTEST_CUDA_EVENT", "0")
+            )
+            if int(os.environ.get("AITER_LOG_MORE", "0")) or cu_event:
                 latencies = []
                 start_event = torch.cuda.Event(enable_timing=True)
                 end_event = torch.cuda.Event(enable_timing=True)
@@ -91,7 +98,7 @@ def perftest(
                     latencies.append(start_event.elapsed_time(end_event))
                 avg = np.mean(latencies) * 1000
                 logger.info(f"avg: {avg} us/iter from cuda.Event")
-                if use_cuda_event:
+                if cu_event:
                     return data, avg
 
             with tpf.profile(
