@@ -198,6 +198,7 @@ def flydsl_a16w4_gemm2(
     xcd_swizzle=1,
     w_dtype="fp4",
     persist=None,
+    pipe=None,
     epilog="atomic",
     stream=None,
 ):
@@ -208,6 +209,9 @@ def flydsl_a16w4_gemm2(
     rocdl.waves_per_eu, ``b_nt`` -> W-load cache modifier, ``xcd_swizzle`` -> XCD/HBM
     grid remap. ``k_batch`` for parity (must be 1). ``b_nt`` is the W-load cache
     modifier (0=cached, 2=nt), taken as-is (cached when unset).
+
+    ``pipe`` (opt-in, default OFF; byte-identical when off): gemm1-aligned software
+    pipeline -- double-buffered A-LDS + B prefetch (iter-10 DeepSeek-V4.1-Flash).
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm2 only supports k_batch=1, got {k_batch}")
@@ -234,6 +238,7 @@ def flydsl_a16w4_gemm2(
     # close the E896 gap (padded launch's empty CTAs early-return ~free), kept as an
     # opt-in building block.
     _persist = False if persist is None else bool(persist)
+    _pipe = False if pipe is None else bool(pipe)
     launch = compile_gemm2_a16w4_port(
         BM=BM,
         NE=NE,
@@ -249,6 +254,7 @@ def flydsl_a16w4_gemm2(
         rocm_arch=str(get_rocm_arch()),
         epilog=epilog,
         topk=topk,
+        pipe=_pipe,
     )
     grid = gemm2_a16w4_grid(
         BM, N_OUT=D_HIDDEN, TILE_N=TILE_N, max_m_blocks=max_m_blocks, persist=_persist
