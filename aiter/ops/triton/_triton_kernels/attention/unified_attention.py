@@ -132,6 +132,7 @@ def kernel_unified_attention_2d(
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
     SPLIT_UNMASKED_LOOP: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
+    PREFETCH_BLOCK_IDX: tl.constexpr = False,  # bool
 ):
     # SPLIT_UNMASKED_LOOP does not support SHUFFLED_KV_CACHE or SLIDING_WINDOW.
     tl.static_assert(
@@ -373,6 +374,15 @@ def kernel_unified_attention_2d(
 
         masked_tile_start = unmasked_tile_end
 
+    if PREFETCH_BLOCK_IDX:
+        # The block-table entry of the next tile is loaded one tile ahead as a scalar: the K/V
+        # loads of a tile no longer wait for a dependent per-element block-table gather, and the
+        # per-element gather no longer holds a mask pair per register file slot (SGPR spills).
+        next_block_idx = tl.load(
+            block_tables_ptr
+            + block_table_offset
+            + (masked_tile_start * TILE_SIZE) // BLOCK_SIZE
+        )
     for j in range(masked_tile_start, tile_end):
         seq_offset = j * TILE_SIZE + offs_t
         # to reduce the masking effect when not needed
@@ -400,9 +410,20 @@ def kernel_unified_attention_2d(
                 + offs_shfl
             )
         else:
-            physical_block_idx = tl.load(
-                block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
-            ).to(tl.int64)
+            if PREFETCH_BLOCK_IDX:
+                cur_block_idx = next_block_idx
+                next_block_idx = tl.load(
+                    block_tables_ptr
+                    + block_table_offset
+                    + (tl.minimum(j + 1, tile_end - 1) * TILE_SIZE) // BLOCK_SIZE
+                )
+                physical_block_idx = (
+                    cur_block_idx + tl.zeros([TILE_SIZE], dtype=tl.int32)
+                ).to(tl.int64)
+            else:
+                physical_block_idx = tl.load(
+                    block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
+                ).to(tl.int64)
 
             v_offset = (
                 physical_block_idx[:, None] * stride_v_cache_0
