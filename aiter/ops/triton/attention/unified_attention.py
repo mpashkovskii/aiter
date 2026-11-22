@@ -157,7 +157,10 @@ def _gfx950_gluon_supported(params: _UAParams):
         and triton.next_power_of_2(params.head_size) == params.head_size
         and params.head_size_v == params.head_size
         and params.q_dtype in (e4m3_dtype, torch.bfloat16)
-        and params.q_dtype == params.kv_cache_dtype
+        and params.kv_cache_dtype in (e4m3_dtype, torch.bfloat16)
+        # an FP8 query needs an FP8 cache; a BF16 query also reads an FP8 cache,
+        # dequantized in registers, and keeps the QK and PV dots in BF16
+        and (params.q_dtype == params.kv_cache_dtype or params.q_dtype == torch.bfloat16)
     )
 
 
