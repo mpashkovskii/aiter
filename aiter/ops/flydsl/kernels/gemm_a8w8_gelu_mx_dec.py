@@ -60,6 +60,16 @@ class StoreActMXDec(StoreActMX):
     mq_layout = False
     act_tiles = False
 
+    def __init__(self, A_scale, B_scale, C, SC, c_rows, c_cols, c_idx_fn, n_tiles_a, rows_layout=False, ws_layout=False):
+        super().__init__(A_scale, B_scale, C, SC, c_rows, c_cols, c_idx_fn, n_tiles_a)
+        self.rows_layout = rows_layout
+        self.mq_layout = ws_layout
+        self.act_tiles = ws_layout
+        if ws_layout:
+            # the tile layout pads the rows to whole 16-row tiles: the record must cover them
+            gC = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=((c_rows + 15) // 16) * 16 * (c_cols // 2))
+            self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
+
     def _out_index(self, row, hid_col0):
         if const_expr(self.act_tiles):
             # MFMA tile layout (see mxfp8_down_ws_gfx950): a 2 KiB block per (16 rows, 128 hidden columns)
@@ -194,10 +204,7 @@ def compile_gate_up_gelu_mx_dec(
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
-        store_c = StoreActMXDec(A_scale, B_scale, C, SC, c_m, c_n, mfma.idx, N_TILES_A)
-        store_c.rows_layout = rows_scales
-        store_c.mq_layout = ws_layout
-        store_c.act_tiles = ws_layout
+        store_c = StoreActMXDec(A_scale, B_scale, C, SC, c_m, c_n, mfma.idx, N_TILES_A, rows_layout=rows_scales, ws_layout=ws_layout)
 
         c00_frag = [mfma.zero_value] * N_ACCUMS
         c01_frag = [mfma.zero_value] * N_ACCUMS
