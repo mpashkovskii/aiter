@@ -53,7 +53,10 @@ assert LDS_BLOCK_N % ROWS_PER_STEP == 0 and N_TILES_B * 16 * WAVES_N == HID
 
 class StoreActMXDec(StoreActMX):
     """StoreActMX for HID = 160: the up half of the interleaved scale vector starts HID columns after the gate half and the
-    E8M0 bytes are addressed by the global hidden group of the wave."""
+    E8M0 bytes are addressed by the global hidden group of the wave. ``rows_layout`` writes the scales row-major
+    ``[rows, N/64]`` (what the decode-size MX down kernel reads) instead of the ``shuffle_scale_w4`` layout."""
+
+    rows_layout = False
 
     def prefetch(self, base_row, half_rows, wcol0):
         l16 = self.lane_id % 16
@@ -75,12 +78,15 @@ class StoreActMXDec(StoreActMX):
         sel8 = Vec.filled(1, fx.Int32(sel), fx.Int32).bitcast(fx.Int8)
         reg1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int8)
         fx.memref_store_vec(Vec.from_elements([sel8[0]], dtype=fx.Int8), reg1)
-        step = group // 4
-        sc_k1 = step // 2
-        sc_kp = step % 2
-        sc_l0 = (group % 4) * 16
-        n1 = base_row // 32
-        sc_i = ((n1 * self.k1_stride + sc_k1) * 64 + sc_l0 + l16) * 4 + sc_kp * 2 + (grp % 2)
+        if const_expr(self.rows_layout):
+            sc_i = (base_row + grp * 16 + l16) * self.n_sc + group
+        else:
+            step = group // 4
+            sc_k1 = step // 2
+            sc_kp = step % 2
+            sc_l0 = (group % 4) * 16
+            n1 = base_row // 32
+            sc_i = ((n1 * self.k1_stride + sc_k1) * 64 + sc_l0 + l16) * 4 + sc_kp * 2 + (grp % 2)
         # lanes of row-tile groups past n_tiles_a (grp >= 2) have no tile: send their byte out of range
         oob = ((self.c_rows + 255) // 256) * 256 * self.n_sc
         sc_i = (grp < fx.Int32(self.n_tiles_a)).select(sc_i, oob)
@@ -91,12 +97,13 @@ def compile_gate_up_gelu_mx_dec(
     *,
     K: int,
     waves_per_eu: int = 3,
+    rows_scales: bool = False,
 ):
     assert K % BLOCK_K == 0 and K >= 2 * BLOCK_K
     K_ITERS = K // BLOCK_K
     N_ACCUMS = N_TILES_A * N_TILES_B
 
-    _kname = f"flydsl_gelumx_dec_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_F8_F8_F8_w{N_WAVES}_{waves_per_eu}_k{K}"
+    _kname = f"flydsl_gelumx_dec_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_F8_F8_F8_w{N_WAVES}_{waves_per_eu}{'r' if rows_scales else ''}_k{K}"
 
     @fx.struct
     class SharedStorage:
@@ -144,8 +151,9 @@ def compile_gate_up_gelu_mx_dec(
         xcd = wgid % 8
         loc = wgid // 8
         per_xcd = n_tiles // 8
-        block_m = loc % 2
-        block_n = xcd * per_xcd + loc // 2
+        m_tiles = ceildiv(c_m, BLOCK_M)
+        block_m = loc % m_tiles
+        block_n = xcd * per_xcd + loc // m_tiles
 
         A0_gl_offset = (block_m * BLOCK_M) * K
         A1_gl_offset = (block_m * BLOCK_M + LDS_BLOCK_M) * K
@@ -168,6 +176,7 @@ def compile_gate_up_gelu_mx_dec(
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
         store_c = StoreActMXDec(A_scale, B_scale, C, SC, c_m, c_n, mfma.idx, N_TILES_A)
+        store_c.rows_layout = rows_scales
 
         c00_frag = [mfma.zero_value] * N_ACCUMS
         c01_frag = [mfma.zero_value] * N_ACCUMS
