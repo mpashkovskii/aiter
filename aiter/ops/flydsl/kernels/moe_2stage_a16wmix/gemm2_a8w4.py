@@ -225,14 +225,15 @@ def _gemm2_body_a8w4(
     num_acc_n = _n_per_wave // 16
     k_blocks16 = KTILE_BYTES // 16
     _num_n_blocks = N_OUT // TILE_N
-    A_STAGES = max(1, min(a_stages, K_TILES_TOTAL))
+    _n_eff = 1 if a_mode == 2 else _num_n_blocks
+    A_STAGES = (K_TILES_TOTAL if a_mode == 2 else max(1, min(a_stages, K_TILES_TOTAL)))
     A_SLOT_BYTES = BM * KTILE_BYTES
 
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
 
-    m_block_idx = bx_i32 // fx.Int32(_num_n_blocks)
-    n_block_idx = bx_i32 % fx.Int32(_num_n_blocks)
+    m_block_idx = bx_i32 // fx.Int32(_n_eff)
+    n_block_idx = bx_i32 % fx.Int32(_n_eff)
     e = rocdl.readfirstlane(T.i32, _raw(_global_i32_at(arg_eids, m_block_idx)))
     m_row = m_block_idx * fx.Int32(BM)
     by_n = n_block_idx * fx.Int32(TILE_N)
@@ -383,6 +384,11 @@ def _gemm2_body_a8w4(
     n_tile_base = wave * fx.Int32(_n_per_wave)
     cols = [col(by_n, n_tile_base, fx.Int32(ni * 16)) for ni in range_constexpr(num_acc_n)]
 
+    def cols_for(nb):
+        # same mapping with a loop n-block (a_mode==2 full-N CTA)
+        by = nb * fx.Int32(TILE_N)
+        return [col(by, n_tile_base, fx.Int32(ni * 16)) for ni in range_constexpr(num_acc_n)]
+
     # ---- accumulators ------------------------------------------------------
     acc_layout = fx.make_layout(4, 1)
     accm = [
@@ -437,6 +443,58 @@ def _gemm2_body_a8w4(
                 fi.append([fx.Int32(v[0]), fx.Int32(v[1])])
             fr.append(fi)
         return fr
+
+    # ---- a_mode 2: full-N persistent CTA -------------------------------
+    # Stage the whole A row-block (BM x KLEN fp8 = K_TILES_TOTAL slots) once,
+    # then loop all N_OUT/TILE_N n-blocks inside the CTA. A staging and its
+    # barriers are paid once instead of per n-block-CTA, and global A traffic
+    # is divided by N_OUT/TILE_N. The grid then carries m-blocks only (see
+    # gemm2_a8w4_grid / the kernel's _n_eff remap). Epilog per n-block reuses
+    # one BM x TILE_N bf16 slab; the barrier before each epilog joins the
+    # previous epilog's slab reads with this one's writes.
+    if const_expr(a_mode == 2):
+        for s in range_constexpr(K_TILES_TOTAL):
+            store_a_tile(s * TILE_K, s)
+        rocdl.s_waitcnt(lgkmcnt=0)
+        gpu.barrier()
+        lds_acc_fn = fx.Int32(fx.ptrtoint(lds_raw_ptr)) + fx.Int32(A_STAGES * A_SLOT_BYTES)
+        for nb in range_constexpr(_num_n_blocks):
+            cs = cols_for(fx.Int32(nb))
+            for mi in range_constexpr(m_repeat):
+                for ni in range_constexpr(num_acc_n):
+                    accm[mi][ni].store(zero4)
+            b_fn = [load_b_raw(0, c) for c in cs]
+            for kt in range_constexpr(K_TILES_TOTAL):
+                if const_expr(kt + 1 < K_TILES_TOTAL):
+                    b_nxt = [load_b_raw(kt + 1, c) for c in cs]
+                a_frags = preload_a(kt)
+                compute_tile(b_fn, a_frags)
+                if const_expr(kt + 1 < K_TILES_TOTAL):
+                    b_fn = b_nxt
+            gpu.barrier()
+            acc_fn = [
+                [accm[i][J].load().ir_value() for J in range(num_acc_n)]
+                for i in range(m_repeat)
+            ]
+            _atomic_bf16_epilog_ws(
+                lds_acc_fn,
+                acc_fn,
+                arg_out,
+                arg_stids,
+                arg_sweights,
+                arg_swcol,
+                e * fx.Int32(N_OUT),
+                m_row,
+                fx.Int32(nb),
+                wave,
+                lane,
+                i32_M,
+                BM,
+                N_OUT,
+                TILE_N,
+                epilog_mode,
+            )
+        return
 
     # ---- main K loop (gemm1-style software pipeline, a_stages deep) --------
     if const_expr(a_mode == 1):
@@ -504,7 +562,9 @@ def _gemm2_body_a8w4(
     )
 
 
-def gemm2_a8w4_grid(BM, *, N_OUT, TILE_N, max_m_blocks):
+def gemm2_a8w4_grid(BM, *, N_OUT, TILE_N, max_m_blocks, full_n=False):
+    if full_n:
+        return int(max_m_blocks)
     return int(max_m_blocks) * (N_OUT // TILE_N)
 
 
@@ -535,7 +595,13 @@ def compile_gemm2_a8w4(
     assert KLEN % TILE_K == 0, f"KLEN must be a multiple of TILE_K, got {KLEN}/{TILE_K}"
     assert TILE_K % 64 == 0, f"TILE_K must be a multiple of 64, got {TILE_K}"
     _num_n_blocks = N_OUT // TILE_N
-    _a_stages = max(1, min(a_stages, (KLEN // TILE_K) if (KLEN // TILE_K) > 1 else 1))
+    if a_mode == 2:
+        # full-N persistent CTA: one CTA per m-block, A slab holds all K tiles.
+        _a_stages = KLEN // TILE_K
+        _num_n_eff = 1
+    else:
+        _a_stages = max(1, min(a_stages, (KLEN // TILE_K) if (KLEN // TILE_K) > 1 else 1))
+        _num_n_eff = _num_n_blocks
     _lds_bytes = (0 if a_mode == 1 else _a_stages * BM * TILE_K) + BM * TILE_N * 2
 
     _name = f"gemm2_a8w4_ne{NE}_h{N_OUT}_i{KLEN}_bm{BM}_tn{TILE_N}_tk{TILE_K}"
@@ -576,7 +642,7 @@ def compile_gemm2_a8w4(
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
         cumsum0 = _global_i32_at(arg_cumsum, fx.Int32(0))
         total_m_blocks = cumsum0 // fx.Int32(BM)
-        bound = total_m_blocks * fx.Int32(_num_n_blocks)
+        bound = total_m_blocks * fx.Int32(_num_n_eff)
 
         _NXCD = 8
         _xq = _udiv(bound, _NXCD)
@@ -588,7 +654,7 @@ def compile_gemm2_a8w4(
             wgid = xc * _xq + fx.min(xc, _xr) + _udiv(pid, _NXCD)
             if const_expr(_SW <= 0):
                 return wgid
-            _ng = fx.Int32(_SW * _num_n_blocks)
+            _ng = fx.Int32(_SW * _num_n_eff)
             group_id = wgid // _ng
             first_pid_m = group_id * fx.Int32(_SW)
             remaining_m = total_m_blocks - first_pid_m
@@ -596,7 +662,7 @@ def compile_gemm2_a8w4(
             wig = wgid % _ng
             m_block = first_pid_m + (wig % group_size_m)
             n_block = wig // group_size_m
-            return m_block * fx.Int32(_num_n_blocks) + n_block
+            return m_block * fx.Int32(_num_n_eff) + n_block
 
         if bx_i32 < bound:
             _tile = _xcd_np(bx_i32)

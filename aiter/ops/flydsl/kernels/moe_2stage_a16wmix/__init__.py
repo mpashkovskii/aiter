@@ -417,7 +417,10 @@ def flydsl_a8w4_gemm2(
         waves_per_eu=waves_per_eu,
         rocm_arch=str(get_rocm_arch()),
     )
-    grid = gemm2_a8w4_grid(tile_m, N_OUT=D_HIDDEN, TILE_N=tile_n, max_m_blocks=max_m_blocks)
+    grid = gemm2_a8w4_grid(
+        tile_m, N_OUT=D_HIDDEN, TILE_N=tile_n, max_m_blocks=max_m_blocks,
+        full_n=(a_mode == 2),
+    )
     _run_compiled(
         launch,
         inter_fp8.data_ptr(),
