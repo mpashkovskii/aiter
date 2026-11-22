@@ -79,6 +79,7 @@ def _atomic_bf16_epilog_ws(
     BM,
     N_OUT,
     BN,
+    epilog_mode,
 ):
     """a16wmix _atomic_bf16_epilog + per-column weight scale.
 
@@ -162,11 +163,23 @@ def _atomic_bf16_epilog_ws(
                     [w2[0] * weight[mr], w2[1] * weight[mr]], fx.Float32
                 ).to(fx.BFloat16)
                 out_off = row_base_addr + fx.Int32(s * 64)
-                fx.atomic_add(
-                    (out_elems + out_off).llvm_ptr,
-                    pk,
-                    syncscope=fx.rocdl.SyncScope.Agent,
-                )
+                if const_expr(epilog_mode == 0):
+                    fx.atomic_add(
+                        (out_elems + out_off).llvm_ptr,
+                        pk,
+                        syncscope=fx.rocdl.SyncScope.Agent,
+                    )
+                else:
+                    # epilog_mode 1: TIMING ONLY -- plain store instead of the
+                    # atomic add (wrong results for tokens hit by several rows).
+                    # Measures the atomic's share of the end-to-end time.
+                    from flydsl._mlir.dialects import llvm as _llvm
+
+                    _llvm.store(
+                        pk.ir_value(),
+                        (out_elems + out_off).llvm_ptr,
+                        alignment=4,
+                    )
 
 
 def _gemm2_body_a8w4(
@@ -190,6 +203,9 @@ def _gemm2_body_a8w4(
     KLEN,
     NE,
     b_cache_mod=2,
+    a_stages=2,
+    a_mode=0,
+    epilog_mode=0,
     rocm_arch="",
 ):
     """a8w4 stage2 body. K=KLEN (576 true inter), N=N_OUT (model_dim).
@@ -209,7 +225,7 @@ def _gemm2_body_a8w4(
     num_acc_n = _n_per_wave // 16
     k_blocks16 = KTILE_BYTES // 16
     _num_n_blocks = N_OUT // TILE_N
-    A_STAGES = 2 if K_TILES_TOTAL > 1 else 1
+    A_STAGES = max(1, min(a_stages, K_TILES_TOTAL))
     A_SLOT_BYTES = BM * KTILE_BYTES
 
     lane_div_16 = lane // fx.Int32(16)
@@ -283,14 +299,26 @@ def _gemm2_body_a8w4(
     # ---- A (fp8 intermediate) ---------------------------------------------
     # LDS slab: A_STAGES slots of BM x TILE_K bytes, XOR16 swizzled; frag reads
     # ds_read 16B = 16 fp8 = 2 consecutive ku frags.
+    # Copy width adapts to the tile: 16B when the tile gives >=16B per thread,
+    # else 8B or 4B (small BM*TK tiles) -- anything else would silently stage
+    # NOTHING (BM=32/TK=64 gave bytes_per_thread=8 -> num_x_loads=0 with the
+    # original fixed 16B loop; found by cos_diff=nan).
     a_num_i32 = A_STAGES * BM * KTILE_BYTES // 4  # (unused naming ok)
-    x_load_bytes = 16
     a_load_threads = 256
-    bytes_per_thread = (BM * KTILE_BYTES) // a_load_threads
-    num_x_loads = bytes_per_thread // x_load_bytes
+    _tile_dwords = BM * KTILE_BYTES // 4
+    assert _tile_dwords % a_load_threads == 0
+    _per_thread_dwords = _tile_dwords // a_load_threads
+    if _per_thread_dwords % 4 == 0:
+        chunk_i32 = 4
+    elif _per_thread_dwords % 2 == 0:
+        chunk_i32 = 2
+    else:
+        chunk_i32 = 1
+    assert chunk_i32 * 4 <= KTILE_BYTES
+    x_load_bytes = chunk_i32 * 4
+    num_x_loads = _per_thread_dwords // chunk_i32
     tile_k_dwords = KTILE_BYTES // 4
     tx_i32 = fx.Int32(gpu.thread_id("x"))
-    chunk_i32 = x_load_bytes // 4
     tx_base = tx_i32 * fx.Int32(chunk_i32)
 
     x_row_local = []
@@ -306,13 +334,16 @@ def _gemm2_body_a8w4(
     from aiter.ops.flydsl.kernels.mxfp4_gemm_common import _global_i32_buffer_view
 
     x_buf = _global_i32_buffer_view(arg_a, fx.Int64(0xFFFFFFFF))
-    x_dma_tiles4 = fx.logical_divide(x_buf, fx.make_layout(4, 1))
-    x_dma_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_cache_mod), fx.Int32)
+    x_dma_tiles4 = fx.logical_divide(x_buf, fx.make_layout(chunk_i32, 1))
+    _bcopy = {4: fx.rocdl.BufferCopy128b, 2: fx.rocdl.BufferCopy64b, 1: fx.rocdl.BufferCopy32b}[
+        chunk_i32
+    ]
+    x_dma_atom = fx.make_copy_atom(_bcopy(b_cache_mod), fx.Int32)
     s_x_i32_flat = fx.make_view(
         fx.recast_iter(fx.Int32, lds_raw_ptr), fx.make_layout(a_num_i32 * 1, 1)
     )
-    tiles_lds = fx.logical_divide(s_x_i32_flat, fx.make_layout(4, 1))
-    lds_atom = fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32)
+    tiles_lds = fx.logical_divide(s_x_i32_flat, fx.make_layout(chunk_i32, 1))
+    lds_atom = fx.make_copy_atom(fx.UniversalCopy(32 * chunk_i32), fx.Int32)
 
     def store_a_tile(k_byte, slot):
         # stage A[all BM rows][k_byte : k_byte + TKTILE_BYTES] into LDS slot
@@ -325,9 +356,9 @@ def _gemm2_body_a8w4(
             )
             global_byte = x_row_base_bytes[i] + base_dw * 4 + col_sw
             lds_byte = slot_base + x_row_local[i] * KTILE_BYTES + col_bytes
-            src = fx.slice(x_dma_tiles4, (None, global_byte // fx.Int32(16)))
-            dst = fx.slice(tiles_lds, (None, lds_byte // fx.Int32(16)))
-            r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+            src = fx.slice(x_dma_tiles4, (None, global_byte // fx.Int32(x_load_bytes)))
+            dst = fx.slice(tiles_lds, (None, lds_byte // fx.Int32(x_load_bytes)))
+            r = fx.make_rmem_tensor(fx.make_layout(chunk_i32, 1), fx.Int32)
             fx.copy(x_dma_atom, src, r)
             fx.copy(lds_atom, r, dst)
 
@@ -383,30 +414,72 @@ def _gemm2_body_a8w4(
                     aa = _fp8_frag8(a_frags[mi][ku])
                     fx.gemm(mma_atom, accm[mi][ni], aa, bb, accm[mi][ni])
 
-    # ---- main K loop (gemm1-style software pipeline) -----------------------
-    if const_expr(K_TILES_TOTAL == 1):
+    # ---- a_mode 1: A fragments straight from global (no LDS, no K-loop
+    # barrier). The same m-block's A tile is shared by N_OUT/TILE_N CTAs of
+    # this kernel, so these loads hit L1/L2/MALL; register double buffering
+    # hides the latency exactly like load_b_tile does for W.
+    x_dma_tiles8 = fx.logical_divide(x_buf, fx.make_layout(2, 1))
+    a_g_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(0), fx.Int32)
+
+    def load_a_g(kt):
+        fr = []
+        for mi in range_constexpr(m_repeat):
+            row_b = (m_row + fx.Int32(mi * 16) + lane_mod_16) * fx.Int32(K) + (
+                lane_div_16 * fx.Int32(8)
+            )
+            ktb = fx.Int32(kt * TILE_K)
+            fi = []
+            for ku in range_constexpr(k_unroll):
+                byte = row_b + ktb + fx.Int32(ku * 32)
+                r = fx.make_rmem_tensor(fx.make_layout(2, 1), fx.Int32)
+                fx.copy(a_g_atom, fx.slice(x_dma_tiles8, (None, byte // fx.Int32(8))), r)
+                v = fx.Vector(fx.memref_load_vec(r))
+                fi.append([fx.Int32(v[0]), fx.Int32(v[1])])
+            fr.append(fi)
+        return fr
+
+    # ---- main K loop (gemm1-style software pipeline, a_stages deep) --------
+    if const_expr(a_mode == 1):
+        a_cur = load_a_g(0)
+        b_cur = load_b_tile(0)
+        for kt in range_constexpr(K_TILES_TOTAL):
+            if const_expr(kt + 1 < K_TILES_TOTAL):
+                a_nxt = load_a_g(kt + 1)
+                b_nxt = load_b_tile(kt + 1)
+            compute_tile(b_cur, a_cur)
+            if const_expr(kt + 1 < K_TILES_TOTAL):
+                a_cur = a_nxt
+                b_cur = b_nxt
+    elif const_expr(K_TILES_TOTAL == 1):
+        store_a_tile(0, 0)
+    elif const_expr(K_TILES_TOTAL == 1):
         store_a_tile(0, 0)
         b0 = load_b_tile(0)
         gpu.barrier()
         compute_tile(b0, preload_a(0))
         gpu.barrier()
     else:
-        store_a_tile(0, 0)
-        b_cur = load_b_tile(0)
+        for s in range_constexpr(A_STAGES - 1):
+            if const_expr(s < K_TILES_TOTAL):
+                store_a_tile(s * TILE_K, s)
+            if const_expr(s == 0):
+                b_cur = load_b_tile(0)
         for kt in range_constexpr(K_TILES_TOTAL):
-            cur_slot = kt % A_STAGES
             rocdl.s_waitcnt(lgkmcnt=0)
             gpu.barrier()
-            a_frags = preload_a(cur_slot)
+            a_frags = preload_a(kt % A_STAGES)
+            if const_expr(kt + A_STAGES - 1 < K_TILES_TOTAL):
+                store_a_tile((kt + A_STAGES - 1) * TILE_K, (kt + A_STAGES - 1) % A_STAGES)
             if const_expr(kt + 1 < K_TILES_TOTAL):
-                store_a_tile((kt + 1) * TILE_K, (kt + 1) % A_STAGES)
                 b_nxt = load_b_tile(kt + 1)
             compute_tile(b_cur, a_frags)
             if const_expr(kt + 1 < K_TILES_TOTAL):
                 b_cur = b_nxt
 
     gpu.barrier()
-    lds_acc_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr)) + A_STAGES * A_SLOT_BYTES
+    lds_acc_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr)) + (
+        fx.Int32(0) if const_expr(a_mode == 1) else A_STAGES * A_SLOT_BYTES
+    )
     accm_v = [
         [accm[i][J].load().ir_value() for J in range(num_acc_n)]
         for i in range(m_repeat)
@@ -427,6 +500,7 @@ def _gemm2_body_a8w4(
         BM,
         N_OUT,
         TILE_N,
+        epilog_mode,
     )
 
 
@@ -445,25 +519,34 @@ def compile_gemm2_a8w4(
     TILE_K=64,
     xcd_swizzle=0,
     b_cache_mod=2,
+    a_stages=2,
+    a_mode=0,
+    epilog_mode=0,
     waves_per_eu=None,
     rocm_arch,
 ):
     """a8w4 (fp8 A x W4-requantized-to-fp8) MoE stage2 builder, gfx942.
 
-    LDS: A 2 slots x BM x TILE_K bytes + epilog BM x TILE_N bf16 -> 48KB at the
-    default tile (fits the 64KB gfx942 budget).
+    LDS: A a_stages slots x BM x TILE_K bytes + epilog BM x TILE_N bf16 -> 48KB at
+    the default tile (fits the 64KB gfx942 budget).
     """
     assert BM % 16 == 0
     assert TILE_N % 64 == 0 and TILE_N // 4 >= 16
     assert KLEN % TILE_K == 0, f"KLEN must be a multiple of TILE_K, got {KLEN}/{TILE_K}"
     assert TILE_K % 64 == 0, f"TILE_K must be a multiple of 64, got {TILE_K}"
     _num_n_blocks = N_OUT // TILE_N
-    _a_stages = 2 if (KLEN // TILE_K) > 1 else 1
-    _lds_bytes = _a_stages * BM * TILE_K + BM * TILE_N * 2
+    _a_stages = max(1, min(a_stages, (KLEN // TILE_K) if (KLEN // TILE_K) > 1 else 1))
+    _lds_bytes = (0 if a_mode == 1 else _a_stages * BM * TILE_K) + BM * TILE_N * 2
 
     _name = f"gemm2_a8w4_ne{NE}_h{N_OUT}_i{KLEN}_bm{BM}_tn{TILE_N}_tk{TILE_K}"
     if b_cache_mod != 2:
         _name += f"_bcm{b_cache_mod}"
+    if a_stages != 2:
+        _name += f"_as{a_stages}"
+    if epilog_mode != 0:
+        _name += f"_ep{epilog_mode}"
+    if a_mode != 0:
+        _name += f"_ga{a_mode}"
     if xcd_swizzle > 0:
         _name += f"_xcd{xcd_swizzle}"
     if waves_per_eu:
@@ -537,6 +620,9 @@ def compile_gemm2_a8w4(
                 KLEN=KLEN,
                 NE=NE,
                 b_cache_mod=b_cache_mod,
+                a_stages=a_stages,
+                a_mode=a_mode,
+                epilog_mode=epilog_mode,
                 rocm_arch=rocm_arch,
             )
 
