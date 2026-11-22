@@ -57,6 +57,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
 )
 from aiter.ops.moe_mxfp4_aux import _mxfp4_moe_sort_internal_is_supported
 from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
+from aiter.ops import moe_twopass
 from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
 )
@@ -5016,7 +5017,24 @@ def fused_moe_2stages(
         sorted_weights=stage2_sorted_weights,
         **extra_stage2_args,
     )
-    if _stage2_override is None:
+    if _stage2_override is None and moe_twopass.available(
+        metadata.stage2,
+        expert_mask,
+        token_num,
+        model_dim,
+        stage2_sorted_weights,
+        a2,
+        w2,
+    ):
+        # Two-pass CK stage2 (gfx942, per-token fp8, large batches): identity-id
+        # GEMM to a per-sorted-row workspace + Triton weighted reduce, instead
+        # of the atomic bf16 epilogue. See aiter/ops/moe_twopass.py.
+        _stage2_call = functools.partial(
+            moe_twopass.ck_stage2_twopass,
+            *stage2_args,
+            **{**getattr(metadata.stage2, "keywords", {}), **stage2_kwargs},
+        )
+    elif _stage2_override is None:
         _stage2_call = functools.partial(
             metadata.stage2,
             *stage2_args,
