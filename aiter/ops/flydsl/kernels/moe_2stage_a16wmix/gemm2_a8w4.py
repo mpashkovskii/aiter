@@ -457,7 +457,8 @@ def _gemm2_body_a8w4(
             store_a_tile(s * TILE_K, s)
         rocdl.s_waitcnt(lgkmcnt=0)
         gpu.barrier()
-        lds_acc_fn = fx.Int32(fx.ptrtoint(lds_raw_ptr)) + fx.Int32(A_STAGES * A_SLOT_BYTES)
+        lds_acc_fn0 = fx.Int32(fx.ptrtoint(lds_raw_ptr)) + fx.Int32(A_STAGES * A_SLOT_BYTES)
+        _SLAB_BYTES = BM * TILE_N * 2
         for nb in range_constexpr(_num_n_blocks):
             cs = cols_for(fx.Int32(nb))
             for mi in range_constexpr(m_repeat):
@@ -471,13 +472,16 @@ def _gemm2_body_a8w4(
                 compute_tile(b_fn, a_frags)
                 if const_expr(kt + 1 < K_TILES_TOTAL):
                     b_fn = b_nxt
-            gpu.barrier()
+            # No pre-epilog barrier: the epilog slab is double-buffered by nb
+            # parity, and the epilog's own internal barrier (stage -> read)
+            # also joins the previous n-block's reads before this n-block's
+            # stage writes. Fast waves may run a full n-block of MMA ahead.
             acc_fn = [
                 [accm[i][J].load().ir_value() for J in range(num_acc_n)]
                 for i in range(m_repeat)
             ]
             _atomic_bf16_epilog_ws(
-                lds_acc_fn,
+                lds_acc_fn0 + fx.Int32((nb & 1) * _SLAB_BYTES),
                 acc_fn,
                 arg_out,
                 arg_stids,
@@ -596,13 +600,16 @@ def compile_gemm2_a8w4(
     assert TILE_K % 64 == 0, f"TILE_K must be a multiple of 64, got {TILE_K}"
     _num_n_blocks = N_OUT // TILE_N
     if a_mode == 2:
-        # full-N persistent CTA: one CTA per m-block, A slab holds all K tiles.
+        # full-N persistent CTA: one CTA per m-block, A slab holds all K tiles;
+        # the epilog slab is double-buffered (nb parity) so no pre-epilog
+        # barrier is needed (fast waves run one n-block of MMA ahead).
         _a_stages = KLEN // TILE_K
         _num_n_eff = 1
+        _lds_bytes = _a_stages * BM * TILE_K + 2 * BM * TILE_N * 2
     else:
         _a_stages = max(1, min(a_stages, (KLEN // TILE_K) if (KLEN // TILE_K) > 1 else 1))
         _num_n_eff = _num_n_blocks
-    _lds_bytes = (0 if a_mode == 1 else _a_stages * BM * TILE_K) + BM * TILE_N * 2
+        _lds_bytes = (0 if a_mode == 1 else _a_stages * BM * TILE_K) + BM * TILE_N * 2
 
     _name = f"gemm2_a8w4_ne{NE}_h{N_OUT}_i{KLEN}_bm{BM}_tn{TILE_N}_tk{TILE_K}"
     if b_cache_mod != 2:
