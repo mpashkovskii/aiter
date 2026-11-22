@@ -43,7 +43,7 @@ __all__ = [
 ]
 
 
-def requant_w2_to_fp8col(w2_u8, w2_scale, k_true, device=None):
+def requant_w2_to_fp8col(w2_u8, w2_scale, k_true, device=None, pair_k0=False):
     """mxfp4 W2 (production layout) -> e4m3fnuz bytes with per-column exponent shift.
 
     ``w2_u8``:    (E, N, K_pack) uint8, physically k-inner (the triton a16w4 layout
@@ -93,12 +93,22 @@ def requant_w2_to_fp8col(w2_u8, w2_scale, k_true, device=None):
         w8.float(), shifted.float()
     ), "requant_w2_to_fp8col: not bit-exact; per-column spread exceeds fp8 range"
 
-    # kernel byte layout: (E, n_blk, k0, klane, nlane, p) from (E, N, KT)
-    w8b = (
-        w8.view(E, N // 16, 16, KT // 32, 4, 8)
-        .permute(0, 1, 3, 4, 2, 5)
-        .contiguous()
-    )
+    # kernel byte layout from (E, N, KT):
+    #  - default:  (E, n_blk, k0, klane, nlane, p)          (two 8B loads per kt)
+    #  - pair_k0:  (E, n_blk, kpair, klane, nlane, ku, p)   (one 16B load per kt;
+    #              ku halves a K=64 tile: k = kpair*64 + ku*32 + klane*8 + p)
+    if pair_k0:
+        w8b = (
+            w8.view(E, N // 16, 16, KT // 64, 2, 4, 8)
+            .permute(0, 1, 3, 5, 2, 4, 6)
+            .contiguous()
+        )
+    else:
+        w8b = (
+            w8.view(E, N // 16, 16, KT // 32, 4, 8)
+            .permute(0, 1, 3, 4, 2, 5)
+            .contiguous()
+        )
     s_w = torch.exp2((shift.squeeze(1) - 127).float())  # (E, N) fp32
     return w8b.view(E, N * KT), s_w.contiguous()
 
@@ -389,6 +399,7 @@ def flydsl_a8w4_gemm2(
     a_stages=2,
     a_mode=0,
     epilog_mode=0,
+    b_v16=0,
     xcd_swizzle=0,
     stream=None,
 ):
@@ -413,6 +424,7 @@ def flydsl_a8w4_gemm2(
         a_stages=a_stages,
         a_mode=a_mode,
         epilog_mode=epilog_mode,
+        b_v16=b_v16,
         xcd_swizzle=xcd_swizzle,
         waves_per_eu=waves_per_eu,
         rocm_arch=str(get_rocm_arch()),

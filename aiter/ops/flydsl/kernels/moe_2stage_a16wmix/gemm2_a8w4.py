@@ -206,6 +206,7 @@ def _gemm2_body_a8w4(
     a_stages=2,
     a_mode=0,
     epilog_mode=0,
+    b_v16=0,
     rocm_arch="",
 ):
     """a8w4 stage2 body. K=KLEN (576 true inter), N=N_OUT (model_dim).
@@ -258,6 +259,37 @@ def _gemm2_body_a8w4(
     w_tiles8 = _global_i32_buffer_tiles(arg_bq, min(_w_bytes, 0xFFFFFFFF), 2)
     w_copy_atom64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(b_cache_mod), fx.Int32)
     w_reg_lay2 = fx.make_layout(2, 1)
+
+    # b_v16: paired-k0 16B layout (N/16, K/64, klane=4, nlane=16, ku=2, kpack=8),
+    # one BufferCopy128b per (kt, col) instead of two 8B loads. Requires
+    # TILE_K == 64 and the host-side pair_k0 repack (requant_w2_to_fp8col).
+    if b_v16:
+        layout_b16 = fx.make_layout(
+            (N_OUT // 16, K // 64, 4, 16, 2, 8),
+            ((K // 64) * 1024, 1024, 256, 16, 8, 1),
+        )
+        w_tiles16 = _global_i32_buffer_tiles(arg_bq, min(_w_bytes, 0xFFFFFFFF), 4)
+        w_copy_atom128 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(b_cache_mod), fx.Int32)
+
+        def load_b_raw16(kt, col):
+            idx_bytes = fx.Int32(
+                crd2idx(
+                    [
+                        fx.Int64(col.n_blk),
+                        fx.Int64(kt),
+                        fx.Int64(lane_div_16),
+                        fx.Int64(col.n_intra),
+                        fx.Int64(0),
+                        fx.Int64(0),
+                    ],
+                    layout_b16,
+                )
+            )
+            r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+            fx.copy(w_copy_atom128, fx.slice(w_tiles16, (None, idx_bytes // fx.Int32(16))), r)
+            v4 = fx.Vector(fx.memref_load_vec(r))
+            return [[fx.Int32(v4[0]), fx.Int32(v4[1])],
+                    [fx.Int32(v4[2]), fx.Int32(v4[3])]]
 
     class _Col:
         __slots__ = ("n_blk", "n_intra")
@@ -402,8 +434,12 @@ def _gemm2_body_a8w4(
 
     mma_atom = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 32, FP8))
 
+    def load_b_tile_cs(kt, cs):
+        lb = load_b_raw16 if b_v16 else load_b_raw
+        return [lb(kt, c) for c in cs]
+
     def load_b_tile(kt):
-        return [load_b_raw(kt, c) for c in cols]
+        return load_b_tile_cs(kt, cols)
 
     def preload_a(slot):
         return [
@@ -464,10 +500,10 @@ def _gemm2_body_a8w4(
             for mi in range_constexpr(m_repeat):
                 for ni in range_constexpr(num_acc_n):
                     accm[mi][ni].store(zero4)
-            b_fn = [load_b_raw(0, c) for c in cs]
+            b_fn = load_b_tile_cs(0, cs)
             for kt in range_constexpr(K_TILES_TOTAL):
                 if const_expr(kt + 1 < K_TILES_TOTAL):
-                    b_nxt = [load_b_raw(kt + 1, c) for c in cs]
+                    b_nxt = load_b_tile_cs(kt + 1, cs)
                 a_frags = preload_a(kt)
                 compute_tile(b_fn, a_frags)
                 if const_expr(kt + 1 < K_TILES_TOTAL):
@@ -586,6 +622,7 @@ def compile_gemm2_a8w4(
     a_stages=2,
     a_mode=0,
     epilog_mode=0,
+    b_v16=0,
     waves_per_eu=None,
     rocm_arch,
 ):
@@ -602,6 +639,7 @@ def compile_gemm2_a8w4(
     )
     assert KLEN % TILE_K == 0, f"KLEN must be a multiple of TILE_K, got {KLEN}/{TILE_K}"
     assert TILE_K % 64 == 0, f"TILE_K must be a multiple of 64, got {TILE_K}"
+    assert not b_v16 or TILE_K == 64, "b_v16 (paired-k0 16B B loads) requires TILE_K == 64"
     _num_n_blocks = N_OUT // TILE_N
     if a_mode == 2:
         # full-N persistent CTA: one CTA per m-block, A slab holds all K tiles;
@@ -624,6 +662,8 @@ def compile_gemm2_a8w4(
         _name += f"_ep{epilog_mode}"
     if a_mode != 0:
         _name += f"_ga{a_mode}"
+    if b_v16:
+        _name += "_bv16"
     if xcd_swizzle > 0:
         _name += f"_xcd{xcd_swizzle}"
     if waves_per_eu:
@@ -700,6 +740,7 @@ def compile_gemm2_a8w4(
                 a_stages=a_stages,
                 a_mode=a_mode,
                 epilog_mode=epilog_mode,
+                b_v16=b_v16,
                 rocm_arch=rocm_arch,
             )
 
