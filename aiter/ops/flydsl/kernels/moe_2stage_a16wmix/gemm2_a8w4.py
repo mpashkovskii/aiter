@@ -596,6 +596,10 @@ def compile_gemm2_a8w4(
     """
     assert BM % 16 == 0
     assert TILE_N % 64 == 0 and TILE_N // 4 >= 16
+    assert N_OUT % TILE_N == 0, (
+        f"N_OUT must be a multiple of TILE_N, got {N_OUT}/{TILE_N}: "
+        "uncovered output columns would silently never be computed"
+    )
     assert KLEN % TILE_K == 0, f"KLEN must be a multiple of TILE_K, got {KLEN}/{TILE_K}"
     assert TILE_K % 64 == 0, f"TILE_K must be a multiple of 64, got {TILE_K}"
     _num_n_blocks = N_OUT // TILE_N
