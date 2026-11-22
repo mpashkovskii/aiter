@@ -102,6 +102,10 @@ class StoreActMX:
         self.pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
         self.pre = None
 
+    def _out_index(self, row, hid_col0):
+        """Byte offset of the 8 fp8 values of ``row`` starting at hidden column ``hid_col0`` (row-major here)."""
+        return row * self.out_cols + hid_col0
+
     def _sb_vec4(self, col):
         r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
         fx.copy(self.scale_atom_4, fx.slice(self.sb_div, (None, fx.Int32(col))), r)
@@ -167,7 +171,7 @@ class StoreActMX:
         reg8 = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.Int8)
         fx.memref_store_vec(packed, reg8)
         row = base_row + ti * 16 + l16
-        c_index = row * self.out_cols + hid_col0
+        c_index = self._out_index(row, hid_col0)
         fx.copy(self.out_atom_8, reg8, fx.slice(self.c_div, (None, c_index)))
         self.es[ti] = eb
 

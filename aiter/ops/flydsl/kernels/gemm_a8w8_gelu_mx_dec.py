@@ -57,6 +57,21 @@ class StoreActMXDec(StoreActMX):
     ``[rows, N/64]`` (what the decode-size MX down kernel reads) instead of the ``shuffle_scale_w4`` layout."""
 
     rows_layout = False
+    mq_layout = False
+    act_tiles = False
+
+    def _out_index(self, row, hid_col0):
+        if const_expr(self.act_tiles):
+            # MFMA tile layout (see mxfp8_down_ws_gfx950): a 2 KiB block per (16 rows, 128 hidden columns)
+            ks = hid_col0 // 128
+            cs = hid_col0 % 128
+            return (
+                ((row // 16) * (self.out_cols // 128) + ks) * 2048
+                + (cs // 64) * 1024
+                + (((cs % 64) // 16) * 16 + row % 16) * 16
+                + cs % 16
+            )
+        return row * self.out_cols + hid_col0
 
     def prefetch(self, base_row, half_rows, wcol0):
         l16 = self.lane_id % 16
@@ -78,7 +93,10 @@ class StoreActMXDec(StoreActMX):
         sel8 = Vec.filled(1, fx.Int32(sel), fx.Int32).bitcast(fx.Int8)
         reg1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int8)
         fx.memref_store_vec(Vec.from_elements([sel8[0]], dtype=fx.Int8), reg1)
-        if const_expr(self.rows_layout):
+        if const_expr(self.mq_layout):
+            row = base_row + grp * 16 + l16
+            sc_i = (((row // 64) * (self.out_cols // 128) + group // 4) * 4 + group % 4) * 64 + (row % 16) * 4 + (row % 64) // 16
+        elif const_expr(self.rows_layout):
             sc_i = (base_row + grp * 16 + l16) * self.n_sc + group
         else:
             step = group // 4
@@ -98,12 +116,13 @@ def compile_gate_up_gelu_mx_dec(
     K: int,
     waves_per_eu: int = 3,
     rows_scales: bool = False,
+    ws_layout: bool = False,
 ):
     assert K % BLOCK_K == 0 and K >= 2 * BLOCK_K
     K_ITERS = K // BLOCK_K
     N_ACCUMS = N_TILES_A * N_TILES_B
 
-    _kname = f"flydsl_gelumx_dec_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_F8_F8_F8_w{N_WAVES}_{waves_per_eu}{'r' if rows_scales else ''}_k{K}"
+    _kname = f"flydsl_gelumx_dec_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_F8_F8_F8_w{N_WAVES}_{waves_per_eu}{'r' if rows_scales else ''}{'w' if ws_layout else ''}_k{K}"
 
     @fx.struct
     class SharedStorage:
@@ -177,6 +196,8 @@ def compile_gate_up_gelu_mx_dec(
         b_s2r = S2RLoader(wave_n, N_TILES_B)
         store_c = StoreActMXDec(A_scale, B_scale, C, SC, c_m, c_n, mfma.idx, N_TILES_A)
         store_c.rows_layout = rows_scales
+        store_c.mq_layout = ws_layout
+        store_c.act_tiles = ws_layout
 
         c00_frag = [mfma.zero_value] * N_ACCUMS
         c01_frag = [mfma.zero_value] * N_ACCUMS

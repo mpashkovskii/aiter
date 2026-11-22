@@ -223,7 +223,7 @@ def _compile_gate_up_dec(k: int, waves_per_eu: int):
     _lazy_import()
     from .kernels.gemm_a8w8_gelu_mx_dec import compile_gate_up_gelu_mx_dec
 
-    return compile_gate_up_gelu_mx_dec(K=k, waves_per_eu=waves_per_eu, rows_scales=True)
+    return compile_gate_up_gelu_mx_dec(K=k, waves_per_eu=waves_per_eu, ws_layout=True)
 
 
 def flydsl_gate_up_gelu_mx_dec(
@@ -236,16 +236,16 @@ def flydsl_gate_up_gelu_mx_dec(
     *,
     waves_per_eu: int = 3,
 ) -> None:
-    """Decode-size ``flydsl_gate_up_gelu_mx`` (M <= 256): W from ``prepare_gate_up_weight_dec``; writes ``out`` ``[M, N/2]`` fp8
-    and the E8M0 scales ROW-MAJOR ``[M, N/64]`` into ``out_scale`` (>= M * N / 64 bytes), the layout ``flydsl_mx_down_decode``
-    reads."""
+    """Decode-size ``flydsl_gate_up_gelu_mx`` (M <= 256): W from ``prepare_gate_up_weight_dec``; writes the fp8 activation in the
+    MFMA tile layout (``out`` holds ``ceil(M / 16) * 16 * N / 2`` bytes, see ``mxfp8_down_ws_gfx950``) and the E8M0 scales in
+    the "mq" layout into ``out_scale`` (``ceil(M / 256) * 256 * N / 64`` bytes), what ``flydsl_mx_down_ws`` reads."""
     _lazy_import()
     m, k = XQ.shape
     n = W.shape[0]
     if m > 256 or k % BLOCK_K != 0 or k < 2 * BLOCK_K or (n // 2) % HID_DEC != 0:
         raise ValueError(f"[FlyDSL gelu_mx dec] unsupported shape M={m} N={n} K={k}")
-    if tuple(out.shape) != (m, n // 2) or out_scale.numel() < m * (n // 64):
-        raise ValueError("[FlyDSL gelu_mx dec] out must be [M, N/2] and out_scale at least M * N / 64 bytes")
+    if out.numel() < -(-m // 16) * 16 * (n // 2) or out_scale.numel() < scale_numel(m, n // 2):
+        raise ValueError("[FlyDSL gelu_mx dec] out must hold ceil(M/16)*16 * N/2 bytes and out_scale scale_numel(M, N/2)")
     exe = _compile_gate_up_dec(k, waves_per_eu)
     _run_compiled(
         exe,
