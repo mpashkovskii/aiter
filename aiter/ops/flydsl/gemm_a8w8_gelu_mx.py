@@ -185,3 +185,78 @@ def flydsl_mx_down(
         n,
         _fx.Stream(torch.cuda.current_stream(device=XQ.device)),
     )
+
+
+# ---- decode-size (M <= 256) path: 128 x 160-hidden tiles (kernels/gemm_a8w8_gelu_mx_dec.py) ------------------------------
+HID_DEC = 160  # hidden units per tile of the decode kernel (5 MX groups of 32)
+
+
+@functools.lru_cache(maxsize=8)
+def _interleave_index_dec(n_half: int, device: str) -> Tensor:
+    """Row permutation: tile ``t`` of the decode weight is [gate rows t*160.., up rows n_half + t*160..]."""
+    nb = n_half // HID_DEC
+    dev = torch.device(device)
+    return (
+        torch.arange(2, device=dev).view(1, 2, 1) * n_half
+        + torch.arange(nb, device=dev).view(nb, 1, 1) * HID_DEC
+        + torch.arange(HID_DEC, device=dev).view(1, 1, HID_DEC)
+    ).reshape(-1)
+
+
+def prepare_gate_up_weight_dec(w: Tensor, w_scale: Tensor) -> tuple[Tensor, Tensor]:
+    """``w`` ``[2*I, K]`` fp8 (gate rows then up rows), ``w_scale`` ``[2*I]`` fp32 -> (16x16 pre-shuffled weight with 160-hidden
+    gate/up interleave, interleaved scale) for ``flydsl_gate_up_gelu_mx_dec``."""
+    from aiter.ops.shuffle import shuffle_weight
+
+    n = w.shape[0]
+    if (n // 2) % HID_DEC != 0 or (n // 2 // HID_DEC) % 8 != 0:
+        raise ValueError(f"[FlyDSL gelu_mx dec] intermediate size must be a multiple of {8 * HID_DEC}, got {n // 2}")
+    idx = _interleave_index_dec(n // 2, str(w.device))
+    return (
+        shuffle_weight(w[idx].contiguous(), layout=(16, 16)),
+        w_scale.reshape(-1)[idx].contiguous().to(torch.float32),
+    )
+
+
+@functools.lru_cache(maxsize=8)
+def _compile_gate_up_dec(k: int, waves_per_eu: int):
+    _lazy_import()
+    from .kernels.gemm_a8w8_gelu_mx_dec import compile_gate_up_gelu_mx_dec
+
+    return compile_gate_up_gelu_mx_dec(K=k, waves_per_eu=waves_per_eu, ws_layout=True)
+
+
+def flydsl_gate_up_gelu_mx_dec(
+    XQ: Tensor,
+    W: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    out_scale: Tensor,
+    *,
+    waves_per_eu: int = 3,
+) -> None:
+    """Decode-size ``flydsl_gate_up_gelu_mx`` (M <= 256): W from ``prepare_gate_up_weight_dec``; writes the fp8 activation in the
+    MFMA tile layout (``out`` holds ``ceil(M / 16) * 16 * N / 2`` bytes, see ``mxfp8_down_ws_gfx950``) and the E8M0 scales in
+    the "mq" layout into ``out_scale`` (``ceil(M / 256) * 256 * N / 64`` bytes), what ``flydsl_mx_down_ws`` reads."""
+    _lazy_import()
+    m, k = XQ.shape
+    n = W.shape[0]
+    if m > 256 or k % BLOCK_K != 0 or k < 2 * BLOCK_K or (n // 2) % HID_DEC != 0:
+        raise ValueError(f"[FlyDSL gelu_mx dec] unsupported shape M={m} N={n} K={k}")
+    if out.numel() < -(-m // 16) * 16 * (n // 2) or out_scale.numel() < scale_numel(m, n // 2):
+        raise ValueError("[FlyDSL gelu_mx dec] out must hold ceil(M/16)*16 * N/2 bytes and out_scale scale_numel(M, N/2)")
+    exe = _compile_gate_up_dec(k, waves_per_eu)
+    _run_compiled(
+        exe,
+        _i8(XQ.contiguous()).view(-1),
+        _i8(W).view(-1),
+        _i8(out).view(-1),
+        x_scale.reshape(-1).contiguous().to(torch.float32),
+        w_scale,
+        _i8(out_scale).view(-1),
+        m,
+        n,
+        _fx.Stream(torch.cuda.current_stream(device=XQ.device)),
+    )
+
