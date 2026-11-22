@@ -207,6 +207,7 @@ def _gemm2_body_a8w4(
     a_mode=0,
     epilog_mode=0,
     b_v16=0,
+    a_v16=0,
     rocm_arch="",
 ):
     """a8w4 stage2 body. K=KLEN (576 true inter), N=N_OUT (model_dim).
@@ -341,12 +342,20 @@ def _gemm2_body_a8w4(
     _tile_dwords = BM * KTILE_BYTES // 4
     assert _tile_dwords % a_load_threads == 0
     _per_thread_dwords = _tile_dwords // a_load_threads
-    if _per_thread_dwords % 4 == 0:
+    if a_v16:
+        # 8B-store chunks only: the a_v16 pairing permutes 8B units inside a
+        # 16B block, so a 16B global copy could not fetch a chunk in one op.
+        chunk_i32 = 2
+    elif _per_thread_dwords % 4 == 0:
         chunk_i32 = 4
     elif _per_thread_dwords % 2 == 0:
         chunk_i32 = 2
     else:
         chunk_i32 = 1
+    if a_v16:
+        assert chunk_i32 * 4 <= KTILE_BYTES and KTILE_BYTES == 64, (
+            "a_v16 A-frag pairing is defined for TILE_K=64 (4 16B blocks/row-tile)"
+        )
     assert chunk_i32 * 4 <= KTILE_BYTES
     x_load_bytes = chunk_i32 * 4
     num_x_loads = _per_thread_dwords // chunk_i32
@@ -384,9 +393,19 @@ def _gemm2_body_a8w4(
         slot_base = slot * A_SLOT_BYTES
         for i in range_constexpr(num_x_loads):
             col_bytes = x_col_dw[i] * 4
-            col_sw = _a16w4_swizzle_xor16(
-                x_row_local[i], fx.Int32(col_bytes), fx.Int32(k_blocks16), enable=True
-            )
+            if const_expr(a_v16 == 0):
+                col_sw = _a16w4_swizzle_xor16(
+                    x_row_local[i], fx.Int32(col_bytes), fx.Int32(k_blocks16), enable=True
+                )
+            else:
+                # a16 pairing: LDS 8B unit t <- canonical unit
+                # g(t) = (t%2)*4 + ((t//2) ^ (row & (k_blocks16-1))): lane ld16's
+                # two ku frags land in one 16B block (see lds_load_a16).
+                t = col_bytes // 8
+                g = (t % 2) * 4 + (
+                    (t // 2) ^ (x_row_local[i] & fx.Int32(k_blocks16 - 1))
+                )
+                col_sw = g * 8
             global_byte = x_row_base_bytes[i] + base_dw * 4 + col_sw
             lds_byte = slot_base + x_row_local[i] * KTILE_BYTES + col_bytes
             src = fx.slice(x_dma_tiles4, (None, global_byte // fx.Int32(x_load_bytes)))
@@ -397,6 +416,22 @@ def _gemm2_body_a8w4(
 
     tiles_lds8 = fx.logical_divide(s_x_i32_flat, fx.make_layout(2, 1))  # 8-byte tiles
     lds_atom64 = fx.make_copy_atom(fx.UniversalCopy(64), fx.Int32)
+
+    tiles_lds16 = fx.logical_divide(s_x_i32_flat, fx.make_layout(4, 1))
+    lds_atom128 = fx.make_copy_atom(fx.UniversalCopy(128), fx.Int32)
+
+    def lds_load_a16(mi, slot):
+        # one 16B ds_read covering this lane's ku=0/1 fp8 frags of row mi:
+        # store_a_tile's pairing puts frags (ku=0/1) of lane_div_16 into the
+        # (xor16-swizzled) 16B block lane_div_16 of the row.
+        row = lane_mod_16 + fx.Int32(mi * 16)
+        blk_sw = lane_div_16 ^ (row & fx.Int32(k_blocks16 - 1))
+        tile16_idx = fx.Int32((slot * A_SLOT_BYTES + row * KTILE_BYTES) // 16) + blk_sw
+        r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+        fx.copy_atom_call(lds_atom128, fx.slice(tiles_lds16, (None, tile16_idx)), r)
+        v = fx.Vector(fx.memref_load_vec(r))
+        return [[fx.Int32(v[0]), fx.Int32(v[1])],
+                [fx.Int32(v[2]), fx.Int32(v[3])]]
 
     def lds_load_a(mi, ku, slot):
         # v2i32 fp8 fragment: A[row][kt*TK.. + ku*32 + lane_div_16*8 .. +8]:
@@ -442,6 +477,8 @@ def _gemm2_body_a8w4(
         return load_b_tile_cs(kt, cols)
 
     def preload_a(slot):
+        if const_expr(a_v16 != 0):
+            return [lds_load_a16(mi, slot) for mi in range_constexpr(m_repeat)]
         return [
             [lds_load_a(mi, ku, slot) for ku in range_constexpr(k_unroll)]
             for mi in range_constexpr(m_repeat)
@@ -623,6 +660,7 @@ def compile_gemm2_a8w4(
     a_mode=0,
     epilog_mode=0,
     b_v16=0,
+    a_v16=0,
     waves_per_eu=None,
     rocm_arch,
 ):
@@ -664,6 +702,8 @@ def compile_gemm2_a8w4(
         _name += f"_ga{a_mode}"
     if b_v16:
         _name += "_bv16"
+    if a_v16:
+        _name += "_av16"
     if xcd_swizzle > 0:
         _name += f"_xcd{xcd_swizzle}"
     if waves_per_eu:
@@ -741,6 +781,7 @@ def compile_gemm2_a8w4(
                 a_mode=a_mode,
                 epilog_mode=epilog_mode,
                 b_v16=b_v16,
+                a_v16=a_v16,
                 rocm_arch=rocm_arch,
             )
 

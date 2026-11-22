@@ -400,6 +400,7 @@ def flydsl_a8w4_gemm2(
     a_mode=0,
     epilog_mode=0,
     b_v16=0,
+    a_v16=0,
     xcd_swizzle=0,
     stream=None,
 ):
@@ -425,6 +426,7 @@ def flydsl_a8w4_gemm2(
         a_mode=a_mode,
         epilog_mode=epilog_mode,
         b_v16=b_v16,
+        a_v16=a_v16,
         xcd_swizzle=xcd_swizzle,
         waves_per_eu=waves_per_eu,
         rocm_arch=str(get_rocm_arch()),
