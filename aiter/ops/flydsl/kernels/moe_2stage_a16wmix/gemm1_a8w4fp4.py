@@ -159,6 +159,7 @@ def _gemm1_body_a8w4fp4(
     b_cache_mod=2,
     a_stages=2,
     rocm_arch="",
+    dbg_bconst=0,
 ):
     """a8w4-FP4W stage1 body. K=KLEN (model_dim), N cols: gate [0,INTER), up +INTER.
 
@@ -414,8 +415,13 @@ def _gemm1_body_a8w4fp4(
             rg, cg = b_g[ni]
             ru, cu = b_u[ni]
             for ku in range_constexpr(k_unroll):
-                bg = _fp8_frag8(_fp4w_win_to_fp8x8(rg[ku], cg[ku]))
-                bu = _fp8_frag8(_fp4w_win_to_fp8x8(ru[ku], cu[ku]))
+                if const_expr(dbg_bconst):
+                    _c = fx.Int32(dbg_bconst)
+                    bg = _fp8_frag8([_c, _c])
+                    bu = _fp8_frag8([_c, _c])
+                else:
+                    bg = _fp8_frag8(_fp4w_win_to_fp8x8(rg[ku], cg[ku]))
+                    bu = _fp8_frag8(_fp4w_win_to_fp8x8(ru[ku], cu[ku]))
                 for mi in range_constexpr(m_repeat):
                     aa = _fp8_frag8(a_frags[mi][ku])
                     fx.gemm(mma_atom, acc_gate[mi][ni], aa, bg, acc_gate[mi][ni])
@@ -507,6 +513,7 @@ def compile_gemm1_a8w4fp4(
     a_stages=2,
     act="silu_clamp",
     waves_per_eu=None,
+    dbg_bconst=0,
     rocm_arch,
 ):
     """a8w4-FP4W (fp8 A x native mxfp4 W1, in-register fp8 synth) MoE stage1.
@@ -541,6 +548,8 @@ def compile_gemm1_a8w4fp4(
         _name += f"_xcd{xcd_swizzle}"
     if waves_per_eu:
         _name += f"_w{waves_per_eu}"
+    if dbg_bconst:
+        _name += f"_dbc{dbg_bconst:x}"
 
     @fx.struct
     class SharedStorage:
@@ -639,6 +648,7 @@ def compile_gemm1_a8w4fp4(
                 b_cache_mod=b_cache_mod,
                 a_stages=a_stages,
                 rocm_arch=rocm_arch,
+                dbg_bconst=dbg_bconst,
             )
 
     @flyc.jit

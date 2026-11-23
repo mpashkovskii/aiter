@@ -632,6 +632,7 @@ def flydsl_a8w4fp4_gemm1(
     a_stages=2,
     xcd_swizzle=0,
     act="silu_clamp",
+    dbg_bconst=0,
     stream=None,
 ):
     """a8w4-FP4W stage1 (iter-18): fp8 A x native mxfp4 W1, in-register fp8 synth.
@@ -662,6 +663,7 @@ def flydsl_a8w4fp4_gemm1(
         xcd_swizzle=xcd_swizzle,
         waves_per_eu=waves_per_eu,
         act=act,
+        dbg_bconst=dbg_bconst,
         rocm_arch=str(get_rocm_arch()),
     )
     grid = gemm1_a8w4fp4_grid(
