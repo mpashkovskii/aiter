@@ -777,27 +777,19 @@ class AsyncKVLoader:
 
     @gluon.jit
     def load_block_ids(self, i):
-        within = 0
         if self.kv_cfg.REMOVE_INDIRECT_ACCESS:
             blk = i
         else:
             # clamp to the last column so the loop's j+2 prefetch
             # never reads past the (padded) block table
-            if self.cfg.TILE_SIZE != self.cfg.BLOCK_SIZE:
-                # tile inside one page: scalar page id plus the tile's token offset in it
-                tok = i * self.cfg.TILE_SIZE
-                i = gl.minimum(tok // self.cfg.BLOCK_SIZE, self.block_table_stride - 1)
-                within = (tok % self.cfg.BLOCK_SIZE) * self.cfg.stride_k_cache_1
-            else:
-                within = 0
-                if self.cfg.ALL_DECODE:
-                    i = gl.minimum(i, self.block_table_stride - 1)
+            if self.cfg.ALL_DECODE:
+                i = gl.minimum(i, self.block_table_stride - 1)
             blk = gl.load(self.block_tables_ptr_shifted + i)
         # For >2 GB caches (not USE_LOAD_BUFFER_OP) this is the one term that can exceed int32
         if self.cfg.USE_LOAD_BUFFER_OP:
-            return blk * self.cfg.stride_k_cache_0 + within
+            return blk * self.cfg.stride_k_cache_0
         else:
-            return blk.to(gl.int64) * self.cfg.stride_k_cache_0 + within
+            return blk.to(gl.int64) * self.cfg.stride_k_cache_0
 
 
 @aggregate
@@ -1946,7 +1938,6 @@ def _unified_attention_gluon_kernel(
     REMOVE_INDIRECT_ACCESS: gl.constexpr = False,
     NUM_BUFFERS: gl.constexpr = 2,
     OVERLAP: gl.constexpr = False,
-    FAST_PAGED: gl.constexpr = False,
     MFMA_DIM: gl.constexpr = 32,
     USE_SOFTCAP: gl.constexpr = False,
     SHUFFLED_KV_CACHE: gl.constexpr = False,
@@ -2127,8 +2118,7 @@ def _unified_attention_gluon_kernel(
         return
 
     # TILE_SIZE == BLOCK_SIZE: one page per tile (fast path). Otherwise gather
-    # A tile inside one page (FAST_PAGED) also takes the scalar page-id loader
-    if (TILE_SIZE == BLOCK_SIZE) or FAST_PAGED:
+    if TILE_SIZE == BLOCK_SIZE:
         KVLoader: gl.constexpr = AsyncKVLoader
     else:
         KVLoader: gl.constexpr = AsyncGatherKVLoader
