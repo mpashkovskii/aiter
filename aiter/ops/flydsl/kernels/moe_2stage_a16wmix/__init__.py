@@ -26,15 +26,115 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 from .gemm1 import compile_gemm1_a16w4_port, gemm1_a16w4_grid
 from .gemm2 import compile_gemm2_a16w4_port, gemm2_a16w4_grid
+from .gemm2_a8w4 import compile_gemm2_a8w4, gemm2_a8w4_grid
 
 __all__ = [
     "compile_gemm1_a16w4_port",
     "compile_gemm2_a16w4_port",
+    "compile_gemm2_a8w4",
     "flydsl_a16w4_gemm1",
     "flydsl_a16w4_gemm2",
+    "flydsl_a8w4_gemm2",
     "gemm1_a16w4_grid",
     "gemm2_a16w4_grid",
+    "gemm2_a8w4_grid",
+    "requant_w2_to_fp8col",
+    "requant_a_to_fp8",
+    "gather_requant_fp8",
+    "moe_stage2_a8w4_forward",
 ]
+
+
+def requant_w2_to_fp8col(w2_u8, w2_scale, k_true, device=None, pair_k0=False):
+    """mxfp4 W2 (production layout) -> e4m3fnuz bytes with per-column exponent shift.
+
+    ``w2_u8``:    (E, N, K_pack) uint8, physically k-inner (the triton a16w4 layout
+                  transposed: logical (E, K_pack, N) with stride(-2)==1 also works --
+                  the physical (N, K_pack) 2D content is what is consumed).
+    ``w2_scale``: (E, K_groups, N) e8m0/uint8 in the same physical orientation as the
+                  triton path stores it: physical (E, K_groups, N), group-major.
+    ``k_true``:   true inter columns; columns beyond are padding (skipped).
+
+    Returns ``(w8_preshuffled, s_w)``:
+      w8_preshuffled: (E, N, k_true) e4m3fnuz bytes in the kernel's
+                      (N/16, K/32, klane=4, nlane=16, kpack=8) byte layout,
+                      contiguous per expert.
+      s_w:            (E, N) fp32 per-column scale = 2^(max_e8m0_group - 127).
+
+    Lossless whenever the per-column e8m0 spread is <= ~11 octaves (measured 5 on
+    the DeepSeek-V4.1-Flash checkpoint); asserts bit-exactness on the whole tensor.
+    """
+    import torch
+
+    w = w2_u8  # logical (E, K_pack, N) or (E, N, K_pack) -- see docstring
+    s = w2_scale
+    if w.stride(-2) == 1:  # triton layout: logical (E, K_pack, N), physical (E, N, K_pack)
+        w = w.transpose(1, 2).contiguous()  # -> physical (E, N, K_pack)
+    else:
+        w = w.contiguous()
+    s = s.contiguous()  # (E, K_groups, N)
+    E, N, KP = w.shape
+    KT = k_true
+    G_true = KT // 32
+    dev = w.device
+
+    lo = (w & 0x0F).to(torch.int32)
+    hi = (w >> 4).to(torch.int32)
+    e2m1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], device=dev)
+    lo_v = torch.where((lo & 8) != 0, -e2m1[(lo & 7).long()], e2m1[(lo & 7).long()])
+    hi_v = torch.where((hi & 8) != 0, -e2m1[(hi & 7).long()], e2m1[(hi & 7).long()])
+    mag = torch.stack([lo_v, hi_v], dim=-1).view(E, N, KP * 2)[:, :, :KT]  # (E, N, KT)
+
+    s_exp = s.view(torch.uint8).to(torch.int32)[:, :G_true, :]  # (E, G_true, N)
+    shift = s_exp.amax(dim=1, keepdim=True)  # (E, 1, N) per-column max exponent
+    ksh = (s_exp - shift).repeat_interleave(32, dim=1)  # (E, KT, N)
+    shifted = mag * torch.exp2(ksh.float()).transpose(1, 2)  # (E, N, KT)
+
+    w8 = shifted.to(torch.float8_e4m3fnuz)
+    assert torch.equal(
+        w8.float(), shifted.float()
+    ), "requant_w2_to_fp8col: not bit-exact; per-column spread exceeds fp8 range"
+
+    # kernel byte layout from (E, N, KT):
+    #  - default:  (E, n_blk, k0, klane, nlane, p)          (two 8B loads per kt)
+    #  - pair_k0:  (E, n_blk, kpair, klane, nlane, ku, p)   (one 16B load per kt;
+    #              ku halves a K=64 tile: k = kpair*64 + ku*32 + klane*8 + p)
+    if pair_k0:
+        w8b = (
+            w8.view(E, N // 16, 16, KT // 64, 2, 4, 8)
+            .permute(0, 1, 3, 5, 2, 4, 6)
+            .contiguous()
+        )
+    else:
+        w8b = (
+            w8.view(E, N // 16, 16, KT // 32, 4, 8)
+            .permute(0, 1, 3, 4, 2, 5)
+            .contiguous()
+        )
+    s_w = torch.exp2((shift.squeeze(1) - 127).float())  # (E, N) fp32
+    return w8b.view(E, N * KT), s_w.contiguous()
+
+
+def requant_a_to_fp8(x_bf16, k_true):
+    """bf16 [rows, K_pad] intermediate -> (fp8 [rows, k_true], s_a [rows] fp32).
+
+    Prototype host version (torch ops); the production server path uses a fused
+    kernel. Per-row amax over the true K columns.
+
+    Scaled to +-240, NOT the e4m3fnuz max of 448: this torch build's
+    ``.to(torch.float8_e4m3fnuz)`` cast overflows to NaN above ~248 (it applies
+    e4m3fn saturating-NaN semantics, measured iter-10 on ROCm). 240 keeps every
+    rounded value inside the cast's working range; the scale is fp32 so no
+    dynamic range is lost, only <1 bit of the fp8 exponent vs scaling to 448.
+    """
+    import torch
+
+    x = x_bf16[:, :k_true].float()
+    amax = x.abs().amax(dim=-1).clamp(min=1e-12)
+    s_a = amax / 240.0
+    a8 = (x / s_a[:, None]).to(torch.float8_e4m3fnuz)
+    return a8.contiguous(), s_a.contiguous()
+
 
 
 # gfx942 (CDNA3) lacks K=32 mfma_f32_16x16x32_bf16 + v_cvt_pk_bf16_f32 -> K=16 MFMA +
@@ -198,6 +298,7 @@ def flydsl_a16w4_gemm2(
     xcd_swizzle=1,
     w_dtype="fp4",
     persist=None,
+    pipe=None,
     epilog="atomic",
     stream=None,
 ):
@@ -208,6 +309,9 @@ def flydsl_a16w4_gemm2(
     rocdl.waves_per_eu, ``b_nt`` -> W-load cache modifier, ``xcd_swizzle`` -> XCD/HBM
     grid remap. ``k_batch`` for parity (must be 1). ``b_nt`` is the W-load cache
     modifier (0=cached, 2=nt), taken as-is (cached when unset).
+
+    ``pipe`` (opt-in, default OFF; byte-identical when off): gemm1-aligned software
+    pipeline -- double-buffered A-LDS + B prefetch (iter-10 DeepSeek-V4.1-Flash).
     """
     if k_batch != 1:
         raise NotImplementedError(f"a16w4 gemm2 only supports k_batch=1, got {k_batch}")
@@ -234,6 +338,7 @@ def flydsl_a16w4_gemm2(
     # close the E896 gap (padded launch's empty CTAs early-return ~free), kept as an
     # opt-in building block.
     _persist = False if persist is None else bool(persist)
+    _pipe = False if pipe is None else bool(pipe)
     launch = compile_gemm2_a16w4_port(
         BM=BM,
         NE=NE,
@@ -249,6 +354,7 @@ def flydsl_a16w4_gemm2(
         rocm_arch=str(get_rocm_arch()),
         epilog=epilog,
         topk=topk,
+        pipe=_pipe,
     )
     grid = gemm2_a16w4_grid(
         BM, N_OUT=D_HIDDEN, TILE_N=TILE_N, max_m_blocks=max_m_blocks, persist=_persist
@@ -269,3 +375,85 @@ def flydsl_a16w4_gemm2(
         torch.cuda.current_stream() if stream is None else stream,
     )
     return flat_out
+
+
+def flydsl_a8w4_gemm2(
+    *,
+    inter_fp8,
+    w8_preshuffled,
+    w2_col_scale,
+    sorted_expert_ids,
+    cumsum_tensor,
+    sorted_token_ids,
+    combined_weights,
+    flat_out,
+    M_logical,
+    max_sorted,
+    NE,
+    D_HIDDEN,
+    KLEN,
+    topk,
+    tile_m=128,
+    tile_n=128,
+    tile_k=64,
+    waves_per_eu=None,
+    b_nt=None,
+    a_stages=2,
+    a_mode=0,
+    epilog_mode=0,
+    b_v16=0,
+    a_v16=0,
+    xcd_swizzle=0,
+    stream=None,
+):
+    """a8w4 stage2 (iter-10): fp8 A x requantized W4 (fp8, per-column scale).
+
+    ``inter_fp8``        e4m3fnuz [sorted_size, KLEN] produced by requant_a_to_fp8.
+    ``w8_preshuffled``   fp8 bytes from requant_w2_to_fp8col (per expert contiguous).
+    ``w2_col_scale``     fp32 (E, N) per-column scale (epilogue multiply).
+    ``combined_weights`` fp32 per sorted row = gamma * s_a[row] (host-side product).
+    ``flat_out``         zeroed bf16 [M_logical, D_HIDDEN] (atomic accumulate).
+    """
+    _b_cache_mod = 2 if b_nt is None else b_nt
+    max_m_blocks = int(sorted_expert_ids.numel())
+    launch = compile_gemm2_a8w4(
+        BM=tile_m,
+        NE=NE,
+        N_OUT=D_HIDDEN,
+        KLEN=KLEN,
+        TILE_N=tile_n,
+        TILE_K=tile_k,
+        b_cache_mod=_b_cache_mod,
+        a_stages=a_stages,
+        a_mode=a_mode,
+        epilog_mode=epilog_mode,
+        b_v16=b_v16,
+        a_v16=a_v16,
+        xcd_swizzle=xcd_swizzle,
+        waves_per_eu=waves_per_eu,
+        rocm_arch=str(get_rocm_arch()),
+    )
+    grid = gemm2_a8w4_grid(
+        tile_m, N_OUT=D_HIDDEN, TILE_N=tile_n, max_m_blocks=max_m_blocks,
+        full_n=(a_mode == 2),
+    )
+    _run_compiled(
+        launch,
+        inter_fp8.data_ptr(),
+        w8_preshuffled.data_ptr(),
+        sorted_expert_ids.data_ptr(),
+        cumsum_tensor.to(torch.int32).contiguous().data_ptr(),
+        sorted_token_ids.data_ptr(),
+        combined_weights.data_ptr(),
+        w2_col_scale.view(-1).contiguous().data_ptr(),
+        int(M_logical),
+        int(max_m_blocks),
+        int(grid),
+        flat_out.data_ptr(),
+        torch.cuda.current_stream() if stream is None else stream,
+    )
+    return flat_out
+
+
+# iter-14 server wire-in (imports the wrappers above; keep at module end).
+from .stage2_a8w4_server import gather_requant_fp8, moe_stage2_a8w4_forward

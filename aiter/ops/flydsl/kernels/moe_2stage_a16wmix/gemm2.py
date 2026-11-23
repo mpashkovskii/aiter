@@ -276,11 +276,19 @@ def _gemm2_body_a16w4(
     rocm_arch="",
     use_reduce=False,
     topk=1,
+    pipe=False,
 ):
     """a16w4/a16wi4/a16w16 stage2 body. K=inter_dim (contraction), N=model_dim (N_OUT).
 
     A = bf16 stage1 intermediate by SORTED position. W2 = mxfp4/int4/bf16 (see gemm1).
     Output = bf16 atomic-fadd (routing-weighted) scatter to [tokens, model_dim].
+
+    ``pipe`` (iter-10 DeepSeek-V4.1-Flash): the gemm1-aligned software pipeline --
+    A-LDS double-buffered (tile kt+1 DMA into the pong slot while kt is consumed),
+    B raw + B-scale for kt+1 issued before kt's MFMA cluster so they stay in flight,
+    phase-separated preload_a (read resident A-LDS into registers before issuing
+    kt+1's DMA so per-read vmcnt drains don't stall the W stream). The default
+    (pipe=False) keeps the original single-slot, barrier-serialized k loop.
     """
     _is_gfx942 = str(rocm_arch).startswith("gfx942")
     elem_bytes = 2
@@ -295,6 +303,10 @@ def _gemm2_body_a16w4(
     num_acc_n = _n_per_wave // 16
     k_blocks16 = KH_TILE_BYTES // 16
     _num_n_blocks = N_OUT // TILE_N
+    # gemm1-aligned pipeline staging: double-buffered A-LDS slots.
+    _PIPE = pipe and K_TILES_TOTAL > 1
+    A_LDS_STAGES = 2 if _PIPE else 1
+    A_SLOT_BYTES = BM * KH_TILE_BYTES
 
     lane_div_16 = lane // fx.Int32(16)
     lane_mod_16 = lane % fx.Int32(16)
@@ -330,7 +342,7 @@ def _gemm2_body_a16w4(
     c_k_div4 = (K * elem_bytes) // 4
     a_loader = make_a_loader(
         lds_raw_ptr,
-        num_i32=BM * LDS_STRIDE // 2,
+        num_i32=A_LDS_STAGES * BM * LDS_STRIDE // 2,
         BM=BM,
         TILE_K=TILE_K,
         KH_TILE_BYTES=KH_TILE_BYTES,
@@ -344,6 +356,8 @@ def _gemm2_body_a16w4(
         row_base_dwords=lambda row_local: (m_row + row_local) * fx.Int32(c_k_div4),
         dma_cache_mod=b_cache_mod,
         dma_via_vgpr=_is_gfx942,
+        k_grp_base_bytes=fx.Int32(0),
+        A_SLOT_BYTES=A_SLOT_BYTES,
     )
 
     # ---- N-column addressing (W2 cols of model_dim; wave owns _n_per_wave) ------
@@ -373,19 +387,61 @@ def _gemm2_body_a16w4(
 
     _mma = functools.partial(_mma_bf16, mma_atom, _is_gfx942)
 
-    for kt in range_constexpr(K_TILES_TOTAL):
-        base_k = fx.Int32(kt * TILE_K)
-        a_loader.store_tile(base_k)
+    # One K tile of B raw + scale as a single value so the pipeline can keep tile
+    # kt+1 in flight while kt runs its MFMAs.
+    def load_b_tile(base_k):
         b_raw = [b_loader.load_raw(base_k, c) for c in cols]
         b_sc = [b_loader.load_scale(base_k, c) for c in cols]
-        gpu.barrier()
+        return b_raw, b_sc
+
+    def preload_a(read_slot):
+        # Read ALL current-tile A-LDS fragments up front, before the next tile's
+        # A-DMA (gemm1 phase-separated iteration).
+        return [
+            [a_loader.load(mi, ku, slot=read_slot) for ku in range_constexpr(k_unroll)]
+            for mi in range_constexpr(m_repeat)
+        ]
+
+    def compute_tile(b_tile, a_frags):
+        b_raw, b_sc = b_tile
         for ni in range_constexpr(num_acc_n):
             for ku in range_constexpr(k_unroll):
                 bb = b_loader.upconvert(b_raw[ni], ku, b_sc[ni][ku])
                 for mi in range_constexpr(m_repeat):
-                    a8 = a_loader.load(mi, ku)
-                    _mma(accm[mi][ni], a8, bb)
-        gpu.barrier()
+                    _mma(accm[mi][ni], a_frags[mi][ku], bb)
+
+    if const_expr(not _PIPE):
+        for kt in range_constexpr(K_TILES_TOTAL):
+            base_k = fx.Int32(kt * TILE_K)
+            a_loader.store_tile(base_k)
+            b_raw, b_sc = load_b_tile(base_k)
+            gpu.barrier()
+            for ni in range_constexpr(num_acc_n):
+                for ku in range_constexpr(k_unroll):
+                    bb = b_loader.upconvert(b_raw[ni], ku, b_sc[ni][ku])
+                    for mi in range_constexpr(m_repeat):
+                        a8 = a_loader.load(mi, ku)
+                        _mma(accm[mi][ni], a8, bb)
+            gpu.barrier()
+    else:
+        # aiter/gemm1-aligned "ISA-aligned software pipeline": single barrier per
+        # K tile; A(kt+1) DMA + B(kt+1)/scale loads overlap kt's MFMA cluster.
+        a_loader.store_tile(fx.Int32(0), slot=0)
+        b_cur = load_b_tile(fx.Int32(0))
+        for kt in range_constexpr(K_TILES_TOTAL):
+            cur_slot = kt % A_LDS_STAGES
+            # Wait only THIS tile's A staging (lgkmcnt); B's vmem stays in flight.
+            rocdl.s_waitcnt(lgkmcnt=0)
+            gpu.barrier()  # single barrier: A(kt) visible before ds_read
+            a_frags = preload_a(cur_slot)
+            if const_expr(kt + 1 < K_TILES_TOTAL):
+                a_loader.store_tile(
+                    fx.Int32((kt + 1) * TILE_K), slot=(kt + 1) % A_LDS_STAGES
+                )
+                b_nxt = load_b_tile(fx.Int32((kt + 1) * TILE_K))
+            compute_tile(b_cur, a_frags)
+            if const_expr(kt + 1 < K_TILES_TOTAL):
+                b_cur = b_nxt
 
     gpu.barrier()
     lds_acc_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
@@ -459,8 +515,13 @@ def compile_gemm2_a16w4_port(
     rocm_arch,
     epilog="atomic",
     topk=1,
+    pipe=False,
 ):
     """a16w4/a16wi4/a16w16 (bf16 intermediate A x mxfp4/int4/bf16 W2) stage2 builder.
+
+    ``pipe`` (default False): opt-in gemm1-aligned software pipeline (double-buffered
+    A-LDS + B prefetch, single barrier per K tile) for the serialized-load-latency
+    bottleneck this kernel has on memory-bound shapes. Byte-identical when off.
 
     N_OUT = model_dim (down-proj output). D_INTER = inter_dim (contraction).
     ``epilog="atomic"``: routing-weighted scatter into [tokens, model_dim].
@@ -501,7 +562,9 @@ def compile_gemm2_a16w4_port(
     _num_n_blocks = N_OUT // TILE_N
     KH_TILE_BYTES = TILE_K * 2
 
-    _a_bytes = BM * KH_TILE_BYTES
+    _pipe = bool(pipe) and (_K // TILE_K) > 1
+    _a_lds_stages = 2 if _pipe else 1
+    _a_bytes = _a_lds_stages * BM * KH_TILE_BYTES
     if _use_reduce:
         _lds_bytes = max(_a_bytes, BM * TILE_N * 2)
     else:
@@ -517,6 +580,8 @@ def compile_gemm2_a16w4_port(
         _name += f"_w{waves_per_eu}"
     if persist:
         _name += "_persist"
+    if _pipe:
+        _name += "_pipe"
     if _use_reduce:
         _name += f"_reduce_tk{_topk}"
 
@@ -593,6 +658,7 @@ def compile_gemm2_a16w4_port(
                 rocm_arch=rocm_arch,
                 use_reduce=_use_reduce,
                 topk=_topk,
+                pipe=_pipe,
             )
 
         if const_expr(persist):
