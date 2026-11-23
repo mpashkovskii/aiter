@@ -181,9 +181,23 @@ def _gfx950_split_params(params: _UAParams):
 _SW_SPLIT_MAX_Q = 16
 
 
+def _gfx950_short_query_3d(params: _UAParams):
+    """Short queries (spec-decode verify) whose rows fit one decode-grid block.
+
+    The 2d grid's prefill block (BLOCK_M 128) would leave most of its rows
+    empty, while the attn_3d block covers the sequence like a decode step.
+    """
+    if params.sliding_window > 0:
+        return False
+    q_rows = params.max_seqlen_q * params.num_queries_per_kv
+    config = get_unified_attention_config("attn_3d", params, backend="gluon")
+    block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
+    return q_rows <= block_m
+
+
 def _gfx950_split_grid(params: _UAParams):
-    """Decode, and batches too small to fill the GPU, take the split grid."""
-    if params.all_decode:
+    """Decode, short queries and batches too small to fill the GPU take the split grid."""
+    if params.all_decode or _gfx950_short_query_3d(params):
         return True
     # the split carves only the window, so a full table splits like a trimmed one
     if params.sliding_window > 0 and not (
