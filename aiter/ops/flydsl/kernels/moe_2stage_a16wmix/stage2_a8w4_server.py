@@ -27,6 +27,8 @@ In-server overhead vs the plain kernel: one ~170 MB-traffic requant pass
 (fusable into the GEMM1 epilogue later, not required to clear the gate).
 """
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -36,6 +38,9 @@ from aiter.fused_moe import moe_sorting
 from . import flydsl_a8w4_gemm2
 
 __all__ = ["gather_requant_fp8", "moe_stage2_a8w4_forward"]
+
+_DEBUG = os.getenv("AITER_ITER14_G2_DEBUG", "0") == "1"
+_debug_seen: set = set()
 
 
 @triton.jit
@@ -156,6 +161,22 @@ def moe_stage2_a8w4_forward(
     dev = intermediate.device
     n = topk_ids.shape[0]
 
+    # Host-side shape sanity: a malformed signature previously crashed the GPU
+    # with an 6.3M-program _gather_requant_fp8_kernel launch (IMA).
+    rows = intermediate.shape[0]
+    if _DEBUG:
+        key = (topk_ids.shape, rows, tuple(scatter_idx.shape),
+               tuple(gate_scal.shape), str(scatter_idx.dtype))
+        if key not in _debug_seen:
+            _debug_seen.add(key)
+            print(
+                f"[iter14-g2-debug] n={n} topk_ids={tuple(topk_ids.shape)}"
+                f" {topk_ids.dtype} rows={rows} scatter={tuple(scatter_idx.shape)}"
+                f" {scatter_idx.dtype} gate_scal={tuple(gate_scal.shape)}"
+                f" topk={topk} E={num_experts}",
+                flush=True,
+            )
+
     # canonical (token, slot)-ordered gammas for moe_sorting's weight input:
     # canon_g[j] = gate_scal[scatter_idx[j]] (scatter_idx values are sorted rows)
     canon_g = gate_scal.float().index_select(0, scatter_idx.long())
@@ -169,6 +190,19 @@ def moe_stage2_a8w4_forward(
         block_size=tile_m,
         accumulate=True,
     )
+    P = stids.numel()
+    if _DEBUG:
+        torch.cuda.synchronize()
+        smax = int(scatter_idx.to(torch.int64).max().item()) if scatter_idx.numel() else -1
+        e_smax = int(stids.to(torch.int64).max().item()) if P else -1
+        print(
+            f"[iter14-g2-debug] sorted: P={P} seids={tuple(seids.shape)}"
+            f" nvid0={int(nvid[0].item())} scatter_max={smax} stids_max={e_smax}"
+            f" mbuf={tuple(mbuf.shape)}",
+            flush=True,
+        )
+        assert P < (1 << 21), f"absurd sorted size P={P}"
+        assert smax < rows, f"scatter value {smax} >= intermediate rows {rows}"
 
     a8, s_a, cw = gather_requant_fp8(
         intermediate,
@@ -207,4 +241,6 @@ def moe_stage2_a8w4_forward(
         b_v16=b_v16,
         xcd_swizzle=xcd_swizzle,
     )
+    if _DEBUG:
+        torch.cuda.synchronize()
     return out
