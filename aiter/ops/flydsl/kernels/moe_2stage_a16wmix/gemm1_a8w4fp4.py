@@ -160,6 +160,7 @@ def _gemm1_body_a8w4fp4(
     a_stages=2,
     rocm_arch="",
     dbg_bconst=0,
+    dbg_braw=0,
 ):
     """a8w4-FP4W stage1 body. K=KLEN (model_dim), N cols: gate [0,INTER), up +INTER.
 
@@ -655,6 +656,7 @@ def compile_gemm1_a8w4fp4(
                 a_stages=a_stages,
                 rocm_arch=rocm_arch,
                 dbg_bconst=dbg_bconst,
+                dbg_braw=dbg_braw,
             )
 
     @flyc.jit
