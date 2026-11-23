@@ -437,7 +437,6 @@ def _gemm1_body_a8w4fp4(
                                 (i32_out_rows + kt * k_unroll + ku) * inter_i32
                                 + col_g_list[ni]
                             )
-                            * fx.Int32(2)
                         ),
                     )
                 for mi in range_constexpr(m_repeat):
