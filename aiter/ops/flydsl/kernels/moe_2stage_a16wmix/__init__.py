@@ -40,6 +40,8 @@ __all__ = [
     "gemm2_a8w4_grid",
     "requant_w2_to_fp8col",
     "requant_a_to_fp8",
+    "gather_requant_fp8",
+    "moe_stage2_a8w4_forward",
 ]
 
 
@@ -451,3 +453,7 @@ def flydsl_a8w4_gemm2(
         torch.cuda.current_stream() if stream is None else stream,
     )
     return flat_out
+
+
+# iter-14 server wire-in (imports the wrappers above; keep at module end).
+from .stage2_a8w4_server import gather_requant_fp8, moe_stage2_a8w4_forward
