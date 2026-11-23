@@ -149,15 +149,22 @@ def repack_w13_pairwise_to_a16w4_shuffled(w1_ktr, w1_scale_ktr, inter_real):
     s = w1_scale_ktr.view(torch.uint8)
     I = inter_real
     E = w.shape[0]
-    # physical (E, N_pad, K_pack): N rows first, the triton view's last dim.
-    if w.stride(-2) == 1:  # view (E, K_pack, N) over physical (E, N, K_pack)
-        w_nk = w.transpose(-1, -2).contiguous()
-    else:
+    if w.ndim != 3 or s.ndim != 3:
+        raise ValueError(
+            f"w1/scale must be 3D, got {tuple(w.shape)} / {tuple(s.shape)}"
+        )
+    # Server contract: w1 as (E, K_pack, N_pad) and scales as (E, K//32,
+    # N_pad) -- N rows come last in both. Reorient to physical (E, N_pad, K).
+    server_view = s.shape[-2] * 32 == w.shape[-2] and s.shape[-1] == w.shape[-1]
+    if server_view:
+        w_nk = w.transpose(-1, -2).contiguous()  # (E, N_pad, K_pack)
+        s_nk = s.transpose(-1, -2).contiguous()  # (E, N_pad, K//32)
+    else:  # already physical (E, N_pad, K-dim)
         w_nk = w.contiguous()
-    if s.stride(-2) == 1:
-        s_nk = s.transpose(-1, -2).contiguous()
-    else:
         s_nk = s.contiguous()
+    assert s_nk.shape[-1] * 16 == w_nk.shape[-1], (
+        f"scale K groups {tuple(s_nk.shape)} vs packed W bytes {tuple(w_nk.shape)}"
+    )
     n_pad = w_nk.shape[1]
     assert n_pad >= 2 * I, f"N_pad {n_pad} < 2*inter_real {2*I}"
     # GGUU row order [g0..g_{I-1}, u0..u_{I-1}] from pairwise rows [2j+u].
