@@ -19,6 +19,7 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.flydsl.gemm_a8w8_gelu_mx import (
+    flydsl_gate_up_gelu_bf16,
     flydsl_gate_up_gelu_mx,
     flydsl_mx_down,
     prepare_gate_up_weight,
@@ -94,6 +95,29 @@ def test_gate_up_gelu_mx(m, inter, k):
 
 
 @benchmark()
+def test_gate_up_gelu_bf16(m, inter, k):
+    """bf16 epilogue (down_proj stays bf16): out = gelu_tanh(gate) * up, no quantization."""
+    xq, x_scale, w, w_scale = _make_gate_up(m, inter, k)
+    ref = run_torch_gate_up(xq, x_scale, w, w_scale)
+    w_il, w_scale_il = prepare_gate_up_weight(w, w_scale)
+    out = torch.full((m, inter), float("nan"), dtype=dtypes.bf16)  # NaN: unwritten rows fail
+
+    _, us = run_perftest(flydsl_gate_up_gelu_bf16, xq, w_il, x_scale, w_scale_il, out)
+
+    err = checkAllclose(ref, out.to(dtypes.fp32), rtol=2e-2, atol=5e-3 * ref.abs().max().item(), msg="gate_up_gelu_bf16")
+    rel_rms = ((out.to(dtypes.fp32) - ref).pow(2).mean().sqrt() / ref.pow(2).mean().sqrt()).item()
+    assert rel_rms < 4e-3, f"relative RMS error {rel_rms:.4f}"
+    flops = 2 * m * 2 * inter * k
+    return {
+        "gfx": get_gfx_runtime(),
+        "flydsl us": us,
+        "flydsl TFLOPS": flops / us / 1e6,
+        "flydsl err": err,
+        "flydsl rel rms err": rel_rms,
+    }
+
+
+@benchmark()
 def test_mx_down(m, n, k):
     g = torch.Generator(device="cuda").manual_seed(1)
     w = (torch.randn(n, k, generator=g) * 0.7).to(FP8)
@@ -156,6 +180,7 @@ def main():
     rows_gu, rows_dn = [], []
     for m, (inter, hidden, _) in itertools.product(args.tokens, args.mnk):
         rows_gu.append(test_gate_up_gelu_mx(m, inter, hidden))
+        rows_gu.append(test_gate_up_gelu_bf16(m, inter, hidden))
         rows_dn.append(test_mx_down(m, hidden, inter))
     aiter.logger.info("gate_up + gelu*up + MX quant summary:\n%s", pd.DataFrame(rows_gu).to_string(index=False))
     aiter.logger.info("MX down summary:\n%s", pd.DataFrame(rows_dn).to_string(index=False))
