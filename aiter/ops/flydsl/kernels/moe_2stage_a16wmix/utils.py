@@ -398,11 +398,11 @@ _FP4_E2M1_FP8_LUT_LO = 0x44403800  # mag 0..3
 _FP4_E2M1_FP8_LUT_HI = 0x54504C48  # mag 4..7
 
 
-def _fp4x4_e2m1_to_f32x4(nib_i32):
-    """4 E2M1 nibbles (low nibble of each byte) -> 4 unscaled f32.
+def _fp4x4_e2m1_to_fp8_codes(nib_i32):
+    """4 E2M1 nibbles (low nibble of each byte) -> 4 E4M3FNUZ fp8 codes (i32).
 
-    One ``v_perm_b32`` gathers E4M3FNUZ fp8 codes, then ``cvt_pk_f32_fp8``.
-    Sign is forced off when mag==0 so E2M1 -0.0 does not become FNUZ NaN (0x80).
+    One ``v_perm_b32`` gathers the magnitude codes; sign is forced off when
+    mag==0 so E2M1 -0.0 does not become FNUZ NaN (0x80).
     """
     mag = nib_i32 & fx.Int32(0x07070707)
     magbyte = fx.Int32(
@@ -415,7 +415,15 @@ def _fp4x4_e2m1_to_f32x4(nib_i32):
     nz = ((mag + fx.Int32(0x7F7F7F7F)).shrui(fx.Int32(7))) & fx.Int32(0x01010101)
     signbit = (nib_i32 & fx.Int32(0x08080808)) << fx.Int32(4)
     signmask = nz << fx.Int32(7)
-    fp8_i32 = magbyte | (signbit & signmask)
+    return fx.Int32(magbyte | (signbit & signmask))
+
+
+def _fp4x4_e2m1_to_f32x4(nib_i32):
+    """4 E2M1 nibbles (low nibble of each byte) -> 4 unscaled f32.
+
+    One ``v_perm_b32`` gathers E4M3FNUZ fp8 codes, then ``cvt_pk_f32_fp8``.
+    """
+    fp8_i32 = _fp4x4_e2m1_to_fp8_codes(nib_i32)
     lo = fx.Vector(rocdl.cvt_pk_f32_fp8(T.f32x2, _raw(fp8_i32), False))
     hi = fx.Vector(rocdl.cvt_pk_f32_fp8(T.f32x2, _raw(fp8_i32), True))
     return (
@@ -431,26 +439,28 @@ def _fp4_nibble_to_bf16x8(raw_i32, scale_f32):
 
     gfx942 substitute for ``v_cvt_scalef32_pk_bf16_fp4``. Nibble i is bits
     ``[4*i : 4*i+4)``, matching gfx950 cvt sel order (sel 0 = byte0 = K0,K1).
-    E8M0 is a power of two; scale is applied on f32, then packed with the same
-    lshr-16 used by gfx942 int4.
+    iter-18 (DeepSeek-V4.1-Flash G1): the E2M1 magnitudes become E4M3FNUZ fp8
+    codes through the v_perm LUT (as before), but the f32 round-trip + lshr-16
+    bf16 pair pack (~47 VALU/i32) is replaced by byte interleave (2 v_perm)
+    fused with the scale in ``v_cvt_scalef32_pk_bf16_fp8`` (fp8 x scale ->
+    bf16 packed pairs ~29 VALU/i32). The fp8-code i32s are
+    (K0,K2,K4,K6)/(K1,K3,K5,K7); two byte-interleaves make (K0..K3) and
+    (K4..K7) so four sel-addressed converts yield v8bf16 in exactly K order.
     """
     packed = fx.Int32(raw_i32)
     even = packed & fx.Int32(0x0F0F0F0F)  # K0,K2,K4,K6
     odd = packed.shrui(fx.Int32(4)) & fx.Int32(0x0F0F0F0F)  # K1,K3,K5,K7
-    fe = _fp4x4_e2m1_to_f32x4(even)
-    fo = _fp4x4_e2m1_to_f32x4(odd)
-    scale = fx.Float32(scale_f32)
-    f32s = []
-    for i in range_constexpr(4):
-        f32s.append(fe[i] * scale)
-        f32s.append(fo[i] * scale)
-    c16 = fx.Int32(16)
-    hi16 = fx.Int32(0xFFFF0000)
+    ce = _fp4x4_e2m1_to_fp8_codes(even)
+    co = _fp4x4_e2m1_to_fp8_codes(odd)
+    # byte interleave: perm_b32(a=odd, b=even, sel) so sel bytes 0..3 take
+    # from even, 4..7 from odd. lo = (K0,K1,K2,K3), hi = (K4,K5,K6,K7).
+    lo_f = fx.Int32(rocdl.perm_b32(_raw(co), _raw(ce), 0x05040100))
+    hi_f = fx.Int32(rocdl.perm_b32(_raw(co), _raw(ce), 0x07030602))
+    s_raw = _raw(fx.Float32(scale_f32))
     i32s = []
-    for i in range_constexpr(4):
-        b0 = f32s[2 * i].bitcast(fx.Int32)
-        b1 = f32s[2 * i + 1].bitcast(fx.Int32)
-        i32s.append(b0.shrui(c16) | (b1 & hi16))
+    for word, half in ((lo_f, 0), (lo_f, 1), (hi_f, 0), (hi_f, 1)):
+        p = rocdl.cvt_scalef32_pk_bf16_fp8(T.vec(2, T.bf16), _raw(word), s_raw, half)
+        i32s.append(fx.Int32(fx.Vector(p).bitcast(fx.Int32)[0]))
     v4i32 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
     return v4i32.bitcast(fx.BFloat16)
 
