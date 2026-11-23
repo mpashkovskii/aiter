@@ -63,10 +63,11 @@ from .utils import (
 
 FP8 = fx.Float8E4M3FNUZ
 
-# e4m3fnuz byte codes of the E2M1 magnitudes (1), [0x30,0x38,0x3C] for
-# 0.5/1/1.5 and (2) [0x40,0x44,0x48,0x4C] for 2/3/4/6 -- fp8byte_sim.py LUT.
-_FP8_LUT_LO = 0x3C383000  # mags 0..3 -> 0x00,0x30,0x38,0x3C
-_FP8_LUT_HI = 0x4C484440  # mags 4..7 -> 0x40,0x44,0x48,0x4C
+# e4m3fnuz byte codes of the E2M1 magnitudes: bias-8 (FNUZ), exactly the
+# a16w4 kernel's proven table (exponent 0 = 2^-8 subnorm-free; codes of
+# 0.5/1/1.5/2/3/4/6 with bias 8).
+_FP8_LUT_LO = 0x44403800  # mags 0..3 -> 0x00,0x38,0x40,0x44
+_FP8_LUT_HI = 0x54504C48  # mags 4..7 -> 0x48,0x4C,0x50,0x54
 
 
 def _perm_b32(a, b, sel):
