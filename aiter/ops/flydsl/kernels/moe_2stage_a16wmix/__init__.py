@@ -155,7 +155,7 @@ def repack_w13_pairwise_to_a16w4_shuffled(w1_ktr, w1_scale_ktr, inter_real):
         )
     # Server contract: w1 as (E, K_pack, N_pad) and scales as (E, K//32,
     # N_pad) -- N rows come last in both. Reorient to physical (E, N_pad, K).
-    server_view = s.shape[-2] * 32 == w.shape[-2] and s.shape[-1] == w.shape[-1]
+    server_view = s.shape[-2] * 16 == w.shape[-2] and s.shape[-1] == w.shape[-1]
     if server_view:
         w_nk = w.transpose(-1, -2).contiguous()  # (E, N_pad, K_pack)
         s_nk = s.transpose(-1, -2).contiguous()  # (E, N_pad, K//32)
