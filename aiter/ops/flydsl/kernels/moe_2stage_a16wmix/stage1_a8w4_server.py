@@ -47,14 +47,15 @@ def _requant_hidden_fp8_kernel(
 ):
     r = tl.program_id(0).to(tl.int64)
     offs = tl.arange(0, BLOCK_K)
-    x = tl.load(x_ptr + r * K + offs).to(tl.float32)
+    kmask = offs < K
+    x = tl.load(x_ptr + r * K + offs, mask=kmask, other=0.0).to(tl.float32)
     # requant_a_to_fp8 semantics: per-row amax clamped to >=1e-12, scale to
     # +-240 (this ROCm torch build's fp8fnuz cast overflows to NaN above
     # ~248; the fp32 scale loses no dynamic range).
     amax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-12)
     s_a = amax / 240.0
     y = (x / s_a).to(tl.float8e4b8)  # e4m3fnuz on gfx942 (bitwise == torch cast)
-    tl.store(a8_ptr + r * K + offs, y)
+    tl.store(a8_ptr + r * K + offs, y, mask=kmask)
     tl.store(s_a_ptr + r, s_a)
 
 
@@ -74,7 +75,6 @@ def requant_hidden_fp8(hidden, out=None):
     else:
         a8, s_a = out
     BLOCK_K = max(triton.next_power_of_2(k), 64)
-    assert BLOCK_K == k, f"requant_hidden_fp8 requires K a power of two, got {k}"
     _requant_hidden_fp8_kernel[(n,)](
         hidden, a8, s_a, k, BLOCK_K=BLOCK_K, num_warps=8
     )
