@@ -104,7 +104,7 @@ def _fp4w_win_to_fp8x8(raw_i32, cb16_i32):
         # per-16-bit-lane masks 0 or 0xFF from the nz low byte
         em = ((nz & m16) * fx.Int32(0xFF)) & m16
         om = (((nz.shrui(fx.Int32(8))) & m16) * fx.Int32(0xFF)) & m16
-        res = (se & em) | ((so & om).shl(fx.Int32(8)))
+        res = (se & em) | ((so & om) << fx.Int32(8))
         # sign: masked by nz (zero-magnitude must stay +0; 0x80 is FNUZ NaN)
         res = res | (sign_shifted & (nz << fx.Int32(7)))
         return fx.Int32(res)
