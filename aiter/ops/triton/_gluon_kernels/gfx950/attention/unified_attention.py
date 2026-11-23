@@ -639,37 +639,65 @@ class AsyncKVLoader:
         )
 
     @gluon.jit
-    def load_k_to_shared(self, k_offset, buffer_id=0):
+    def load_k_to_shared(self, k_offset, buffer_id=0, mask=None):
         # Async copy K tile from global to shared memory
         if self.cfg.USE_LOAD_BUFFER_OP:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 self.k_shared.index(buffer_id),
                 self.key_cache_ptr,
                 self.k_base_offset + k_offset,
+                mask=mask,
                 cache_modifier=self.cfg.KV_CACHE_MODIFIER,
             )
         else:
             gl.amd.cdna4.async_copy.global_load_to_shared(
                 self.k_shared.index(buffer_id),
                 self.key_cache_ptr + self.k_base_offset + k_offset,
+                mask=mask,
                 cache_modifier=self.cfg.KV_CACHE_MODIFIER,
             )
         gl.amd.cdna4.async_copy.commit_group()
 
     @gluon.jit
-    def load_v_to_shared(self, v_offset, buffer_id=0):
+    def k_row_mask(self, j, key_lo, key_hi):
+        pos = j * self.cfg.TILE_SIZE + gl.arange(
+            0, self.cfg.TILE_SIZE, layout=gl.SliceLayout(0, self.kv_cfg.blocked_k)
+        )[None, :]
+        return (pos >= key_lo) & (pos <= key_hi)
+
+    @gluon.jit
+    def v_zeros(self):
+        return gl.zeros(
+            [self.cfg.TILE_SIZE, self.cfg.HEAD_SIZE],
+            dtype=self.value_cache_ptr.type.element_ty,
+            layout=self.kv_cfg.blocked_v,
+        )
+
+    @gluon.jit
+    def v_row_mask(self, j, key_lo, key_hi):
+        pos = j * self.cfg.TILE_SIZE + gl.arange(
+            0, self.cfg.TILE_SIZE, layout=gl.SliceLayout(1, self.kv_cfg.blocked_v)
+        )[:, None]
+        return (pos >= key_lo) & (pos <= key_hi)
+
+    @gluon.jit
+    def load_v_to_shared(self, v_offset, buffer_id=0, mask=None, other=None):
         # Async copy V tile from global to shared memory
         if self.cfg.USE_LOAD_BUFFER_OP:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 self.v_shared.index(buffer_id),
                 self.value_cache_ptr,
                 self.v_base_offset + v_offset,
+                mask=mask,
+                other=other,
                 cache_modifier=self.cfg.KV_CACHE_MODIFIER,
             )
         else:
             gl.amd.cdna4.async_copy.global_load_to_shared(
                 self.v_shared.index(buffer_id),
                 self.value_cache_ptr + self.v_base_offset + v_offset,
+                mask=mask,
+                other=other,
                 cache_modifier=self.cfg.KV_CACHE_MODIFIER,
             )
         gl.amd.cdna4.async_copy.commit_group()
@@ -746,19 +774,27 @@ class AsyncKVLoader:
 
     @gluon.jit
     def load_block_ids(self, i):
+        within = 0
         if self.kv_cfg.REMOVE_INDIRECT_ACCESS:
             blk = i
         else:
             # clamp to the last column so the loop's j+2 prefetch
             # never reads past the (padded) block table
-            if self.cfg.ALL_DECODE:
-                i = gl.minimum(i, self.block_table_stride - 1)
+            if self.cfg.TILE_SIZE != self.cfg.BLOCK_SIZE:
+                # tile inside one page: scalar page id plus the tile's token offset in it
+                tok = i * self.cfg.TILE_SIZE
+                i = gl.minimum(tok // self.cfg.BLOCK_SIZE, self.block_table_stride - 1)
+                within = (tok % self.cfg.BLOCK_SIZE) * self.cfg.stride_k_cache_1
+            else:
+                within = 0
+                if self.cfg.ALL_DECODE:
+                    i = gl.minimum(i, self.block_table_stride - 1)
             blk = gl.load(self.block_tables_ptr_shifted + i)
         # For >2 GB caches (not USE_LOAD_BUFFER_OP) this is the one term that can exceed int32
         if self.cfg.USE_LOAD_BUFFER_OP:
-            return blk * self.cfg.stride_k_cache_0
+            return blk * self.cfg.stride_k_cache_0 + within
         else:
-            return blk.to(gl.int64) * self.cfg.stride_k_cache_0
+            return blk.to(gl.int64) * self.cfg.stride_k_cache_0 + within
 
 
 @aggregate
@@ -1467,6 +1503,71 @@ class AttentionProgram:
 
 
 @gluon.jit
+def attention_loop_sb_overlap(pgm, kv_loader, q, M, L, acc, key_lo, key_hi):
+    # Decode with a sliding window, one K and one V LDS buffer: the next tile's K is
+    # requested as soon as QK has read the K buffer and its V as soon as the V operand
+    # has left LDS, so a tile's loads overlap the previous tile's softmax and PV. Rows
+    # outside [key_lo, key_hi] (the window edges of the first and last tile) are not fetched.
+    j0 = pgm.tile_start
+    blk = kv_loader.load_block_ids(j0)
+    kv_loader.load_k_to_shared(
+        blk, buffer_id=0, mask=kv_loader.k_row_mask(j0, key_lo, key_hi)
+    )
+    # masked V rows of the first tile are zero-filled: LDS keeps whatever an earlier
+    # kernel left there, and 0 * NaN-pattern would poison the PV product
+    kv_loader.load_v_to_shared(
+        blk,
+        buffer_id=0,
+        mask=kv_loader.v_row_mask(j0, key_lo, key_hi),
+        other=kv_loader.v_zeros(),
+    )
+    for j in range(pgm.tile_start, pgm.tile_end - 1):
+        gl.amd.cdna4.async_copy.wait_group(1)
+        _barrier()
+        k = kv_loader.load_k_from_shared(
+            wait_count=1, target_dtype=q.dtype, buffer_id=0, skip_wait=True
+        )
+        S = pgm.compute_qk(k)
+        _barrier()
+        blk_n = kv_loader.load_block_ids(j + 1)
+        kv_loader.load_k_to_shared(
+            blk_n, buffer_id=0, mask=kv_loader.k_row_mask(j + 1, key_lo, key_hi)
+        )
+        S = pgm.apply_mask_qk(S, j)
+        S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
+        p, alpha, M = pgm.softmax_part0(S, M)
+        p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
+        gl.amd.cdna4.async_copy.wait_group(1)
+        _barrier()
+        v = kv_loader.load_v_from_shared(
+            wait_count=1, target_dtype=q.dtype, buffer_id=0, skip_wait=True
+        )
+        _barrier()
+        kv_loader.load_v_to_shared(
+            blk_n, buffer_id=0, mask=kv_loader.v_row_mask(j + 1, key_lo, key_hi)
+        )
+        acc = pgm.compute_pv(p, v, acc)
+    j = pgm.tile_end - 1
+    gl.amd.cdna4.async_copy.wait_group(1)
+    _barrier()
+    k = kv_loader.load_k_from_shared(
+        wait_count=1, target_dtype=q.dtype, buffer_id=0, skip_wait=True
+    )
+    S = pgm.compute_qk(k)
+    S = pgm.apply_mask_qk(S, j)
+    S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
+    p, alpha, M = pgm.softmax_part0(S, M)
+    p, L, acc = pgm.softmax_part1(p, L, acc, alpha, target_dtype=q.dtype)
+    gl.amd.cdna4.async_copy.wait_group(0)
+    _barrier()
+    v = kv_loader.load_v_from_shared(
+        wait_count=0, target_dtype=q.dtype, buffer_id=0, skip_wait=True
+    )
+    acc = pgm.compute_pv(p, v, acc)
+    return M, L, acc
+
+
+@gluon.jit
 def attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc):
     # One shared buffer, and every warp reads the whole tile because operand B is
     # replicated across warps
@@ -1838,6 +1939,8 @@ def _unified_attention_gluon_kernel(
     CAUSAL: gl.constexpr = True,
     REMOVE_INDIRECT_ACCESS: gl.constexpr = False,
     NUM_BUFFERS: gl.constexpr = 2,
+    OVERLAP: gl.constexpr = False,
+    FAST_PAGED: gl.constexpr = False,
     MFMA_DIM: gl.constexpr = 32,
     USE_SOFTCAP: gl.constexpr = False,
     SHUFFLED_KV_CACHE: gl.constexpr = False,
@@ -2018,7 +2121,8 @@ def _unified_attention_gluon_kernel(
         return
 
     # TILE_SIZE == BLOCK_SIZE: one page per tile (fast path). Otherwise gather
-    if TILE_SIZE == BLOCK_SIZE:
+    # A tile inside one page (FAST_PAGED) also takes the scalar page-id loader
+    if (TILE_SIZE == BLOCK_SIZE) or FAST_PAGED:
         KVLoader: gl.constexpr = AsyncKVLoader
     else:
         KVLoader: gl.constexpr = AsyncGatherKVLoader
@@ -2074,7 +2178,11 @@ def _unified_attention_gluon_kernel(
         (NUM_BUFFERS == 1) | (NUM_BUFFERS == 2), "NUM_BUFFERS must be 1 or 2"
     )
     acc = gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout)
-    if NUM_BUFFERS == 1:
+    if NUM_BUFFERS == 1 and OVERLAP:
+        M, L, acc = attention_loop_sb_overlap(
+            pgm, kv_loader, q, M, L, acc, context_len - SLIDING_WINDOW + 1, context_len
+        )
+    elif NUM_BUFFERS == 1:
         M, L, acc = attention_loop_single_buffer(pgm, kv_loader, q, M, L, acc)
     elif (
         (HEAD_SIZE >= 512)
