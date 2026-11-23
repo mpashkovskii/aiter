@@ -679,7 +679,6 @@ def compile_gemm1_a8w4fp4(
             arg_swcol,
             i32_M,
             i32_max_m_blocks,
-            i32_grid,
             i32_out_rows,
             f32_situ_beta,
             f32_situ_beta_rcp,
