@@ -39,6 +39,7 @@ __all__ = [
     "gemm2_a16w4_grid",
     "gemm2_a8w4_grid",
     "requant_w2_to_fp8col",
+    "repack_w13_pairwise_to_a16w4_shuffled",
     "requant_a_to_fp8",
     "gather_requant_fp8",
     "moe_stage2_a8w4_forward",
@@ -113,6 +114,65 @@ def requant_w2_to_fp8col(w2_u8, w2_scale, k_true, device=None, pair_k0=False):
         )
     s_w = torch.exp2((shift.squeeze(1) - 127).float())  # (E, N) fp32
     return w8b.view(E, N * KT), s_w.contiguous()
+
+
+def repack_w13_pairwise_to_a16w4_shuffled(w1_ktr, w1_scale_ktr, inter_real):
+    """DeepSeek-V4.1 production w13 pairwise fp4 G1 -> FlyDSL a16w4 gemm1 inputs.
+
+    Production vLLM storage (AiterW4A16ExpertsMonolithic, verified 100% against
+    the DeepSeek-V4.1-Flash checkpoint in iter-17 w13_layout_solve2):
+
+      - W: view shaped (E, K_pack, N_pad) with N the contiguous dim (physical
+        (E, N_pad, K_pack)), N_pad rows: gate/up *pairwise* interleaved at row
+        granularity (row = 2j + u; gate row 2j, up row 2j+1, j < inter_real),
+        low nibble = even k; rows [2*inter_real, N_pad) are zero pad.
+      - scales: view shaped (E, K//32, N_pad), e8m0 u8, same pairwise rows.
+
+    This repacks them -- layout only, no requantization, fp4 bytes untouched --
+    into the a16w4 gemm1 ``standard`` inputs on the REAL (unpadded) N_OUT =
+    2*inter_real columns:
+
+      - w1_shuf:    (E, 2*inter_real, K_pack) GGUU (gate block then up block)
+        plain k-inner, through shuffle_weight_a16w4.
+      - scale_shuf: matching shuffle_scale_a16w4 output.
+
+    Shrinks the W1 footprint and the G1 N-compute by N_pad/(2*inter_real)
+    (25% at 1536 -> 1152) and costs nothing at runtime (load-time pass).
+    ``w1_ktr``/``w1_scale_ktr`` may be the transposed server views; they are
+    re-materialized physically here.
+    """
+    import torch
+
+    from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+
+    w = w1_ktr.view(torch.uint8) if w1_ktr.dtype != torch.uint8 else w1_ktr
+    s = w1_scale_ktr.view(torch.uint8)
+    I = inter_real
+    E = w.shape[0]
+    # physical (E, N_pad, K_pack): N rows first, the triton view's last dim.
+    if w.stride(-2) == 1:  # view (E, K_pack, N) over physical (E, N, K_pack)
+        w_nk = w.transpose(-1, -2).contiguous()
+    else:
+        w_nk = w.contiguous()
+    if s.stride(-2) == 1:
+        s_nk = s.transpose(-1, -2).contiguous()
+    else:
+        s_nk = s.contiguous()
+    n_pad = w_nk.shape[1]
+    assert n_pad >= 2 * I, f"N_pad {n_pad} < 2*inter_real {2*I}"
+    # GGUU row order [g0..g_{I-1}, u0..u_{I-1}] from pairwise rows [2j+u].
+    pair = torch.cat(
+        [
+            torch.arange(0, 2 * I, 2, device=w_nk.device),
+            torch.arange(1, 2 * I, 2, device=w_nk.device),
+        ]
+    )
+    w_plain = w_nk.index_select(1, pair).contiguous()  # (E, 2I, K_pack)
+    s_plain = s_nk.index_select(1, pair).contiguous()  # (E, 2I, K//32)
+    k_scale = s_plain.shape[-1]
+    w_shuf = shuffle_weight_a16w4(w_plain, 16, False)
+    s_shuf = shuffle_scale_a16w4(s_plain.view(E * 2 * I, k_scale), E, False)
+    return w_shuf, s_shuf
 
 
 def requant_a_to_fp8(x_bf16, k_true):
@@ -215,9 +275,11 @@ def flydsl_a16w4_gemm1(
         raise NotImplementedError(
             f"a16w4 gemm1 requires D_HIDDEN (K) % {TILE_K} == 0, got H={D_HIDDEN}"
         )
-    if (2 * D_INTER) % 256 != 0:
+    # Whole 16-col W blocks / 32-col e8m0 scale groups are what the layout
+    # needs; 256 was the shipped-models' alignment (unpadded DSV4.1 G1 = 1152).
+    if (2 * D_INTER) % 32 != 0:
         raise NotImplementedError(
-            f"a16w4 gemm1 requires 2*D_INTER % 256 == 0, got D_INTER={D_INTER}"
+            f"a16w4 gemm1 requires 2*D_INTER % 32 == 0, got D_INTER={D_INTER}"
         )
     if D_INTER % TILE_N != 0:
         raise NotImplementedError(

@@ -433,9 +433,12 @@ def compile_gemm1_a16w4_port(
     assert (
         _K % (k_wave * TILE_K) == 0
     ), f"D_HIDDEN (K) must be a multiple of k_wave*TILE_K, got {_K}, k_wave={k_wave}"
+    # N_OUT must fill whole 16-col W blocks and whole 32-col e8m0 scale
+    # groups (256 was the shipped-models' alignment, not a layout constraint;
+    # the unpadded DeepSeek-V4.1-Flash G1 has N_OUT=2*576=1152).
     assert (
-        _N_OUT % 256 == 0
-    ), f"2*D_INTER (N_OUT) must be a multiple of 256, got {_N_OUT}"
+        _N_OUT % 32 == 0
+    ), f"2*D_INTER (N_OUT) must be a multiple of 32, got {_N_OUT}"
     assert (
         _INTER % TILE_N == 0
     ), f"D_INTER must be a multiple of TILE_N={TILE_N}, got {_INTER}"
