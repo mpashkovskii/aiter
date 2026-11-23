@@ -212,6 +212,39 @@ def _gfx950_split_grid(params: _UAParams):
     return config["NUM_SEGMENTS"] > 1
 
 
+# A mixed batch needs this many sequences before its short rows get their own launch.
+_GFX950_MIXED_SPLIT_MIN_SEQS = 16
+
+
+def _gfx950_mixed_short_params(params: _UAParams):
+    """The short rows of a mixed batch as a decode-grid launch, or None.
+
+    A batch with a prompt chunk beside spec-decode verify or decode rows takes
+    the 2d grid, whose prefill block (BLOCK_M 128) leaves most of a short
+    query's rows empty. The rows that fit one attn_3d block run on the decode
+    grid as a short batch would, and the 2d launch skips them; each launch
+    filters by query length in the kernel. Returns the short launch's params
+    (max_seqlen_q is the longest row it keeps) while it runs unsplit.
+    """
+    if params.sliding_window > 0 or params.num_seqs < _GFX950_MIXED_SPLIT_MIN_SEQS:
+        return None
+    probe = params._replace(max_seqlen_q=2)
+    config = get_unified_attention_config("attn_3d", probe, backend="gluon")
+    block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
+    short_q = block_m // params.num_queries_per_kv
+    if short_q < 1 or short_q >= params.max_seqlen_q:
+        return None
+    short = params._replace(max_seqlen_q=short_q)
+    if not _gfx950_short_query_3d(short):
+        return None
+    split = get_unified_attention_config(
+        "kv_split", _gfx950_split_params(short), backend="gluon"
+    )
+    if split["NUM_SEGMENTS"] > 1:
+        return None
+    return short
+
+
 def use_2d_kernel(params: _UAParams, backend: str = "triton"):
     # if IS_DEVICE_ARCH_GFX12, use 3D for decode, and for short (spec-decode verify)
     # queries while their rows are too few to fill the 2D grid; 2D otherwise.
@@ -436,7 +469,21 @@ def unified_attention(
             if DEVICE_ARCH in ("gfx1250", "gfx1250-strict"):
                 _unified_attention_2d_gfx1250(params)
             elif DEVICE_ARCH == "gfx950":
-                _unified_attention_2d_gfx950(params)
+                short = _gfx950_mixed_short_params(params)
+                if short is not None:
+                    config = get_unified_attention_config(
+                        "kv_split", _gfx950_split_params(short), backend="gluon"
+                    )
+                    _, TILE_SIZE = _split_launch_config(config)
+                    _unified_attention_3d_gfx950(
+                        short, out, out, out, 1, TILE_SIZE,
+                        max_query_len=short.max_seqlen_q,
+                    )
+                    _unified_attention_2d_gfx950(
+                        params, min_query_len=short.max_seqlen_q + 1
+                    )
+                else:
+                    _unified_attention_2d_gfx950(params)
             else:
                 assert False, f"No gluon subwrapper for {DEVICE_ARCH}"
         else:
@@ -1091,6 +1138,8 @@ def _unified_attention_gfx950(
     partial_acc=None,
     partial_m=None,
     partial_l=None,
+    min_query_len: int = 0,
+    max_query_len: int = 0,
 ):
     """Single launch site for the gfx950 gluon kernel.
 
@@ -1117,6 +1166,9 @@ def _unified_attention_gfx950(
     if params.all_decode:
         total_query_blocks = params.num_seqs
         grid = (total_query_blocks, params.num_kv_heads)
+    elif max_query_len:
+        # every kept sequence fits one query block
+        grid = (params.num_kv_heads, params.num_seqs)
     else:
         total_query_blocks = params.num_tokens // BLOCK_Q + params.num_seqs
         grid = (params.num_kv_heads, total_query_blocks)
@@ -1195,11 +1247,13 @@ def _unified_attention_gfx950(
         partial_m_ptr=partial_m,
         partial_l_ptr=partial_l,
         partial_acc_ptr=partial_acc,
+        MIN_QUERY_LEN=min_query_len,
+        MAX_QUERY_LEN=max_query_len,
         enable_fp_fusion=True,
     )
 
 
-def _unified_attention_2d_gfx950(params: _UAParams):
+def _unified_attention_2d_gfx950(params: _UAParams, min_query_len: int = 0):
     """Prefill and mixed batches: one program per (kv head, query block)."""
 
     config = get_unified_attention_config("attn_2d", params, backend="gluon")
@@ -1210,6 +1264,7 @@ def _unified_attention_2d_gfx950(params: _UAParams):
         BLOCK_M=BLOCK_M,
         TILE_SIZE=config["TILE_SIZE"],
         num_warps=config["num_warps"],
+        min_query_len=min_query_len,
     )
 
 
@@ -1220,6 +1275,7 @@ def _unified_attention_3d_gfx950(
     segm_expsum,
     NUM_SEGMENTS,
     TILE_SIZE,
+    max_query_len: int = 0,
 ):
     """Decode and split batches: one program per (query block, kv head[, KV split]).
 
@@ -1250,4 +1306,5 @@ def _unified_attention_3d_gfx950(
         partial_acc=segm_output if split else None,
         partial_m=segm_max if split else None,
         partial_l=segm_expsum if split else None,
+        max_query_len=max_query_len,
     )

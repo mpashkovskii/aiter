@@ -1767,6 +1767,11 @@ def _unified_attention_gluon_kernel(
     partial_m_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS]
     partial_l_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS]
     partial_acc_ptr=None,  # [num_tokens, num_query_heads, NUM_SPLITS, head_size]
+    # Query-length filter (0 = off): a mixed batch launched twice, short rows on
+    # the decode grid and long rows on the prefill grid, each skipping the other's.
+    # MAX_QUERY_LEN also makes the grid one program per sequence.
+    MIN_QUERY_LEN: gl.constexpr = 0,
+    MAX_QUERY_LEN: gl.constexpr = 0,
 ):
     NUM_WARPS: gl.constexpr = gl.num_warps()
     if ALL_DECODE:
@@ -1817,7 +1822,21 @@ def _unified_attention_gluon_kernel(
         output_stride_0 = output_stride_0.to(gl.int64)
         output_stride_1 = output_stride_1.to(gl.int64)
 
-    if not ALL_DECODE:
+    if not ALL_DECODE and MAX_QUERY_LEN > 0:
+        # Short rows of a mixed batch: one program per sequence (each fits one
+        # query block), skipping the sequences the prefill-grid launch takes.
+        seq_idx = q_block_global_idx
+        q_block_local_idx: gl.int32 = 0
+        cur_batch_in_all_start_index = gl.load(query_start_len_ptr + seq_idx).to(
+            gl.int32
+        )
+        cur_batch_in_all_stop_index = gl.load(query_start_len_ptr + seq_idx + 1).to(
+            gl.int32
+        )
+        cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+        if cur_batch_query_len > MAX_QUERY_LEN:
+            return
+    elif not ALL_DECODE:
         seq_idx = find_seq_idx(
             query_start_len_ptr, q_block_global_idx, num_seqs, cfg.BLOCK_Q
         )
@@ -1836,6 +1855,9 @@ def _unified_attention_gluon_kernel(
         # Not needed when num programs is computed precisely
         if q_block_local_idx * cfg.BLOCK_Q >= cur_batch_query_len:
             return
+        if MIN_QUERY_LEN > 0:
+            if cur_batch_query_len < MIN_QUERY_LEN:
+                return
     else:
         # Decode fast path: one program per sequence, no binary search
         seq_idx = q_block_global_idx
