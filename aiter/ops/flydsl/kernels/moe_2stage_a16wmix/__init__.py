@@ -47,6 +47,7 @@ __all__ = [
     "gather_requant_fp8",
     "moe_stage2_a8w4_forward",
     "requant_hidden_fp8",
+    "sorted_output_rows",
     "moe_stage1_a8w4_forward",
 ]
 
@@ -548,4 +549,8 @@ def flydsl_a8w4_gemm1(
 # iter-14 server wire-in (imports the wrappers above; keep at module end).
 from .stage2_a8w4_server import gather_requant_fp8, moe_stage2_a8w4_forward
 # iter-17 server wire-in
-from .stage1_a8w4_server import requant_hidden_fp8, moe_stage1_a8w4_forward
+from .stage1_a8w4_server import (
+    requant_hidden_fp8,
+    sorted_output_rows,
+    moe_stage1_a8w4_forward,
+)
