@@ -428,7 +428,27 @@ def _gemm1_body_a8w4fp4(
                     bu = _fp8_frag8(_fp4w_win_to_fp8x8(ru[ku], cu[ku]))
                 if const_expr(dbg_bdump):
                     _codes = _fp4w_win_to_fp8x8(rg[ku], cg[ku])
-                    _byte0 = _codes[0] & fx.Int32(0xFF)
+                    _sel_e = rg[ku] & fx.Int32(0x07070707)
+                    _base = _perm_b32(
+                        fx.Int32(_FP8_LUT_HI), fx.Int32(_FP8_LUT_LO), _sel_e
+                    )
+                    _nz = (
+                        (_sel_e + fx.Int32(0x7F7F7F7F)).shrui(fx.Int32(7))
+                    ) & fx.Int32(0x01010101)
+                    _em = ((_nz & fx.Int32(0x00FF00FF)) * fx.Int32(0xFF)) & fx.Int32(
+                        0x00FF00FF
+                    )
+                    _pair = {
+                        1: _codes[0],
+                        2: rg[ku],
+                        3: _sel_e,
+                        4: _base,
+                        5: _nz,
+                        6: _em,
+                        7: _codes[1],
+                        8: fx.Int32(_FP8_LUT_LO),
+                    }
+                    _byte0 = _pair[dbg_bdump] & fx.Int32(0xFF)
                     buffer_ops.buffer_store(
                         fx.Float32(_byte0).to(fx.BFloat16),
                         _raw(dump_rsrc),
