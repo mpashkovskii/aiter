@@ -27,21 +27,27 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from .gemm1 import compile_gemm1_a16w4_port, gemm1_a16w4_grid
 from .gemm2 import compile_gemm2_a16w4_port, gemm2_a16w4_grid
 from .gemm2_a8w4 import compile_gemm2_a8w4, gemm2_a8w4_grid
+from .gemm1_a8w4 import compile_gemm1_a8w4, gemm1_a8w4_grid
 
 __all__ = [
     "compile_gemm1_a16w4_port",
     "compile_gemm2_a16w4_port",
     "compile_gemm2_a8w4",
+    "compile_gemm1_a8w4",
     "flydsl_a16w4_gemm1",
     "flydsl_a16w4_gemm2",
     "flydsl_a8w4_gemm2",
+    "flydsl_a8w4_gemm1",
     "gemm1_a16w4_grid",
     "gemm2_a16w4_grid",
     "gemm2_a8w4_grid",
+    "gemm1_a8w4_grid",
     "requant_w2_to_fp8col",
     "requant_a_to_fp8",
     "gather_requant_fp8",
     "moe_stage2_a8w4_forward",
+    "requant_hidden_fp8",
+    "moe_stage1_a8w4_forward",
 ]
 
 
@@ -455,5 +461,91 @@ def flydsl_a8w4_gemm2(
     return flat_out
 
 
+def flydsl_a8w4_gemm1(
+    *,
+    a8_fp8,
+    s_a,
+    w8_preshuffled,
+    w1_col_scale,
+    sorted_expert_ids,
+    cumsum_tensor,
+    sorted_token_ids,
+    sorted_out_rows,
+    inter_sorted_bf16,
+    n_tokens,
+    NE,
+    INTER,
+    KLEN,
+    topk,
+    swiglu_limit=10.0,
+    tile_m=32,
+    tile_n=192,
+    tile_k=64,
+    waves_per_eu=None,
+    b_nt=None,
+    a_stages=2,
+    b_v16=1,
+    xcd_swizzle=0,
+    act="silu_clamp",
+    stream=None,
+):
+    """a8w4 stage1 (iter-17): fp8 A x requantized W4 (fp8, per-column scale).
+
+    ``a8_fp8``           e4m3fnuz [n_tokens, KLEN] from requant_hidden_fp8.
+    ``s_a``              fp32 [n_tokens + 1] per-token A scales (+1 pad row).
+    ``w8_preshuffled``   fp8 bytes from requant_w2_to_fp8col(W1, pair_k0=b_v16).
+    ``w1_col_scale``     fp32 (E, 2*INTER) per-column scale (epilogue multiply).
+    ``sorted_out_rows``  i32 [P]: aiter sorted output row per moe-sort position
+                         (-1 padding); from sorted_output_rows.
+    ``inter_sorted_bf16`` bf16 [aiter_rows, INTER] output (production contract).
+    """
+    _b_cache_mod = 2 if b_nt is None else b_nt
+    max_m_blocks = int(sorted_expert_ids.numel())
+    launch = compile_gemm1_a8w4(
+        BM=tile_m,
+        NE=NE,
+        INTER=INTER,
+        KLEN=KLEN,
+        TOPK=topk,
+        TILE_N=tile_n,
+        TILE_K=tile_k,
+        b_cache_mod=_b_cache_mod,
+        a_stages=a_stages,
+        b_v16=b_v16,
+        xcd_swizzle=xcd_swizzle,
+        waves_per_eu=waves_per_eu,
+        act=act,
+        rocm_arch=str(get_rocm_arch()),
+    )
+    grid = gemm1_a8w4_grid(
+        tile_m, INTER=INTER, TILE_N=tile_n, max_m_blocks=max_m_blocks
+    )
+    _run_compiled(
+        launch,
+        a8_fp8.data_ptr(),
+        w8_preshuffled.data_ptr(),
+        sorted_expert_ids.data_ptr(),
+        cumsum_tensor.to(torch.int32).contiguous().data_ptr(),
+        sorted_token_ids.data_ptr(),
+        sorted_out_rows.data_ptr(),
+        s_a.data_ptr(),
+        w1_col_scale.view(-1).contiguous().data_ptr(),
+        int(n_tokens),
+        int(max_m_blocks),
+        int(grid),
+        int(inter_sorted_bf16.shape[0]),
+        1.0,  # situ_beta / beta_rcp: unused for silu/silu_clamp values below
+        1.0,
+        1.0,
+        1.0,
+        float(swiglu_limit),
+        inter_sorted_bf16.data_ptr(),
+        torch.cuda.current_stream() if stream is None else stream,
+    )
+    return inter_sorted_bf16
+
+
 # iter-14 server wire-in (imports the wrappers above; keep at module end).
 from .stage2_a8w4_server import gather_requant_fp8, moe_stage2_a8w4_forward
+# iter-17 server wire-in
+from .stage1_a8w4_server import requant_hidden_fp8, moe_stage1_a8w4_forward
