@@ -73,6 +73,24 @@ def _perm_b32(a, b, sel):
     return fx.Int32(rocdl.perm_b32(_raw(a), _raw(b), _raw(sel)))
 
 
+def _fp8_synth_half(sel, sign_shifted, cb16_i32):
+    """One nibble-parity half (4 k) of the fp8 fragment: LUT + offset + sign."""
+    base = _perm_b32(fx.Int32(_FP8_LUT_HI), fx.Int32(_FP8_LUT_LO), sel)
+    nz = ((sel + fx.Int32(0x7F7F7F7F)).shrui(fx.Int32(7))) & fx.Int32(0x01010101)
+    m16 = fx.Int32(0x00FF00FF)
+    e16 = base & m16
+    o16 = (base.shrui(fx.Int32(8))) & m16
+    se = (e16 + cb16_i32) & m16
+    so = (o16 + cb16_i32) & m16
+    # per-16-bit-lane masks 0 or 0xFF from the nz low byte
+    em = ((nz & m16) * fx.Int32(0xFF)) & m16
+    om = (((nz.shrui(fx.Int32(8))) & m16) * fx.Int32(0xFF)) & m16
+    res = (se & em) | ((so & om) << fx.Int32(8))
+    # sign: masked by nz (zero-magnitude must stay +0; 0x80 is FNUZ NaN)
+    res = res | (sign_shifted & (nz << fx.Int32(7)))
+    return fx.Int32(res)
+
+
 def _fp4w_win_to_fp8x8(raw_i32, cb16_i32):
     """Synthesize the 8 fp8 codes of one (col, K32i) B MMA fragment.
 
@@ -89,36 +107,17 @@ def _fp4w_win_to_fp8x8(raw_i32, cb16_i32):
     c0 = fx.Int32(0x07070707)
     sel_e = raw_i32 & c0  # mags of k 0,2,4,6 at bytes 0..3
     sel_o = (raw_i32.shrui(fx.Int32(4))) & c0  # mags of k 1,3,5,7
-    lut_lo = fx.Int32(_FP8_LUT_LO)
-    lut_hi = fx.Int32(_FP8_LUT_HI)
-    out = []
-
-    def synth(sel, sign_shifted):
-        base = _perm_b32(lut_hi, lut_lo, sel)
-        nz = ((sel + fx.Int32(0x7F7F7F7F)).shrui(fx.Int32(7))) & fx.Int32(0x01010101)
-        m16 = fx.Int32(0x00FF00FF)
-        e16 = base & m16
-        o16 = (base.shrui(fx.Int32(8))) & m16
-        se = (e16 + cb16_i32) & m16
-        so = (o16 + cb16_i32) & m16
-        # per-16-bit-lane masks 0 or 0xFF from the nz low byte
-        em = ((nz & m16) * fx.Int32(0xFF)) & m16
-        om = (((nz.shrui(fx.Int32(8))) & m16) * fx.Int32(0xFF)) & m16
-        res = (se & em) | ((so & om) << fx.Int32(8))
-        # sign: masked by nz (zero-magnitude must stay +0; 0x80 is FNUZ NaN)
-        res = res | (sign_shifted & (nz << fx.Int32(7)))
-        return fx.Int32(res)
-
     # even-k half: sign bits are raw bit3 of each byte of sel parity
     sgn_e = (raw_i32 & fx.Int32(0x08080808)) << fx.Int32(4)
     # odd-k half: sign already sits at bit 7
     sgn_o = raw_i32 & fx.Int32(0x80808080)
-    codes_e = synth(sel_e, sgn_e)  # fp8 of k 0,2,4,6 at bytes 0..3
-    codes_o = synth(sel_o, sgn_o)  # fp8 of k 1,3,5,7 at bytes 0..3
+    codes_e = _fp8_synth_half(sel_e, sgn_e, cb16_i32)  # fp8 of k 0,2,4,6
+    codes_o = _fp8_synth_half(sel_o, sgn_o, cb16_i32)  # fp8 of k 1,3,5,7
     # interleave byte-wise: out0 = [e0,o0,e1,o1], out1 = [e2,o2,e3,o3]
-    out.append(_perm_b32(codes_o, codes_e, fx.Int32(0x5140)))
-    out.append(_perm_b32(codes_o, codes_e, fx.Int32(0x7362)))
-    return out
+    return [
+        _perm_b32(codes_o, codes_e, fx.Int32(0x5140)),
+        _perm_b32(codes_o, codes_e, fx.Int32(0x7362)),
+    ]
 
 
 def _fp8_frag8(v2i32):
@@ -161,6 +160,7 @@ def _gemm1_body_a8w4fp4(
     rocm_arch="",
     dbg_bconst=0,
     dbg_braw=0,
+    dbg_bdump=0,
 ):
     """a8w4-FP4W stage1 body. K=KLEN (model_dim), N cols: gate [0,INTER), up +INTER.
 
@@ -412,6 +412,7 @@ def _gemm1_body_a8w4fp4(
         # per K32i (k_unroll of them laid out by load_b_pair: 2 per 64-K tile
         # -> k_unroll == 2 at tk64; generalize: pair h covers K32i kt*ku + h).
         b_g, b_u = b_tile
+        _dbg_codes = {}
         for ni in range_constexpr(num_acc_n):
             rg, cg = b_g[ni]
             ru, cu = b_u[ni]
