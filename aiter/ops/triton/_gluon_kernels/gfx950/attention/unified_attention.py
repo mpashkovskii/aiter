@@ -639,68 +639,71 @@ class AsyncKVLoader:
         )
 
     @gluon.jit
-    def load_k_to_shared(self, k_offset, buffer_id=0, mask=None):
+    def load_k_to_shared(self, k_offset, buffer_id=0, row_shift=None):
         # Async copy K tile from global to shared memory
+        offsets = self.k_base_offset + k_offset
+        if row_shift is not None:
+            offsets = offsets + row_shift
         if self.cfg.USE_LOAD_BUFFER_OP:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 self.k_shared.index(buffer_id),
                 self.key_cache_ptr,
-                self.k_base_offset + k_offset,
-                mask=mask,
+                offsets,
                 cache_modifier=self.cfg.KV_CACHE_MODIFIER,
             )
         else:
             gl.amd.cdna4.async_copy.global_load_to_shared(
                 self.k_shared.index(buffer_id),
-                self.key_cache_ptr + self.k_base_offset + k_offset,
-                mask=mask,
+                self.key_cache_ptr + offsets,
                 cache_modifier=self.cfg.KV_CACHE_MODIFIER,
             )
         gl.amd.cdna4.async_copy.commit_group()
 
     @gluon.jit
-    def k_row_mask(self, j, key_lo, key_hi):
-        pos = j * self.cfg.TILE_SIZE + gl.arange(
-            0, self.cfg.TILE_SIZE, layout=gl.SliceLayout(0, self.kv_cfg.blocked_k)
-        )[None, :]
-        return (pos >= key_lo) & (pos <= key_hi)
-
-    @gluon.jit
-    def v_zeros(self):
-        return gl.zeros(
-            [self.cfg.TILE_SIZE, self.cfg.HEAD_SIZE],
-            dtype=self.value_cache_ptr.type.element_ty,
-            layout=self.kv_cfg.blocked_v,
-        )
-
-    @gluon.jit
-    def v_row_mask(self, j, key_lo, key_hi):
-        pos = j * self.cfg.TILE_SIZE + gl.arange(
-            0, self.cfg.TILE_SIZE, layout=gl.SliceLayout(1, self.kv_cfg.blocked_v)
-        )[:, None]
-        return (pos >= key_lo) & (pos <= key_hi)
-
-    @gluon.jit
-    def load_v_to_shared(self, v_offset, buffer_id=0, mask=None, other=None):
+    def load_v_to_shared(self, v_offset, buffer_id=0, row_shift=None):
         # Async copy V tile from global to shared memory
+        offsets = self.v_base_offset + v_offset
+        if row_shift is not None:
+            offsets = offsets + row_shift
         if self.cfg.USE_LOAD_BUFFER_OP:
             gl.amd.cdna4.async_copy.buffer_load_to_shared(
                 self.v_shared.index(buffer_id),
                 self.value_cache_ptr,
-                self.v_base_offset + v_offset,
-                mask=mask,
-                other=other,
+                offsets,
                 cache_modifier=self.cfg.KV_CACHE_MODIFIER,
             )
         else:
             gl.amd.cdna4.async_copy.global_load_to_shared(
                 self.v_shared.index(buffer_id),
-                self.value_cache_ptr + self.v_base_offset + v_offset,
-                mask=mask,
-                other=other,
+                self.value_cache_ptr + offsets,
                 cache_modifier=self.cfg.KV_CACHE_MODIFIER,
             )
         gl.amd.cdna4.async_copy.commit_group()
+
+    @gluon.jit
+    def k_row_shift(self, j, key_lo, key_hi):
+        # Offsets that move the tile's rows outside [key_lo, key_hi] onto rows inside it
+        # (same page), so every row is a valid address and the window edges fetch no
+        # new lines, without predicated copies.
+        TILE: gl.constexpr = self.cfg.TILE_SIZE
+        offs_n = gl.arange(
+            0, TILE, layout=gl.SliceLayout(0, self.kv_cfg.blocked_k)
+        )[None, :]
+        lo_row = gl.minimum(gl.maximum(key_lo - j * TILE, 0), TILE - 1)
+        hi_row = gl.minimum(gl.maximum(key_hi - j * TILE, lo_row), TILE - 1)
+        row = gl.minimum(gl.maximum(offs_n, lo_row), hi_row)
+        return (row - offs_n) * self.cfg.stride_k_cache_1
+
+    @gluon.jit
+    def v_row_shift(self, j, key_lo, key_hi):
+        TILE: gl.constexpr = self.cfg.TILE_SIZE
+        offs_n = gl.arange(
+            0, TILE, layout=gl.SliceLayout(1, self.kv_cfg.blocked_v)
+        )[:, None]
+        lo_row = gl.minimum(gl.maximum(key_lo - j * TILE, 0), TILE - 1)
+        hi_row = gl.minimum(gl.maximum(key_hi - j * TILE, lo_row), TILE - 1)
+        row = gl.minimum(gl.maximum(offs_n, lo_row), hi_row)
+        return (row - offs_n) * self.cfg.stride_v_cache_1
 
     @gluon.jit
     def k_tile(self, buffer_id):
@@ -1505,21 +1508,18 @@ class AttentionProgram:
 @gluon.jit
 def attention_loop_sb_overlap(pgm, kv_loader, q, M, L, acc, key_lo, key_hi):
     # Decode with a sliding window, one K and one V LDS buffer: the next tile's K is
-    # requested as soon as QK has read the K buffer and its V as soon as the V operand
-    # has left LDS, so a tile's loads overlap the previous tile's softmax and PV. Rows
-    # outside [key_lo, key_hi] (the window edges of the first and last tile) are not fetched.
+    # requested as soon as QK has read the K buffer and its V as soon as the PV dot has
+    # consumed the V operand, so a tile's loads overlap the previous tile's softmax and
+    # PV. Rows of the first and last tile outside [key_lo, key_hi] are re-read from rows
+    # inside the window (softmax gives them probability 0), which keeps the copies
+    # unpredicated and the async-wait counts exact.
     j0 = pgm.tile_start
     blk = kv_loader.load_block_ids(j0)
     kv_loader.load_k_to_shared(
-        blk, buffer_id=0, mask=kv_loader.k_row_mask(j0, key_lo, key_hi)
+        blk, buffer_id=0, row_shift=kv_loader.k_row_shift(j0, key_lo, key_hi)
     )
-    # masked V rows of the first tile are zero-filled: LDS keeps whatever an earlier
-    # kernel left there, and 0 * NaN-pattern would poison the PV product
     kv_loader.load_v_to_shared(
-        blk,
-        buffer_id=0,
-        mask=kv_loader.v_row_mask(j0, key_lo, key_hi),
-        other=kv_loader.v_zeros(),
+        blk, buffer_id=0, row_shift=kv_loader.v_row_shift(j0, key_lo, key_hi)
     )
     for j in range(pgm.tile_start, pgm.tile_end - 1):
         gl.amd.cdna4.async_copy.wait_group(1)
@@ -1531,7 +1531,9 @@ def attention_loop_sb_overlap(pgm, kv_loader, q, M, L, acc, key_lo, key_hi):
         _barrier()
         blk_n = kv_loader.load_block_ids(j + 1)
         kv_loader.load_k_to_shared(
-            blk_n, buffer_id=0, mask=kv_loader.k_row_mask(j + 1, key_lo, key_hi)
+            blk_n,
+            buffer_id=0,
+            row_shift=kv_loader.k_row_shift(j + 1, key_lo, key_hi),
         )
         S = pgm.apply_mask_qk(S, j)
         S = gl.convert_layout(S, pgm.cfg.pv_layout, assert_trivial=True)
@@ -1542,11 +1544,15 @@ def attention_loop_sb_overlap(pgm, kv_loader, q, M, L, acc, key_lo, key_hi):
         v = kv_loader.load_v_from_shared(
             wait_count=1, target_dtype=q.dtype, buffer_id=0, skip_wait=True
         )
+        acc = pgm.compute_pv(p, v, acc)
+        # after the PV dot: its use of v is what waits for the LDS read to finish, and the
+        # copy below overwrites that buffer
         _barrier()
         kv_loader.load_v_to_shared(
-            blk_n, buffer_id=0, mask=kv_loader.v_row_mask(j + 1, key_lo, key_hi)
+            blk_n,
+            buffer_id=0,
+            row_shift=kv_loader.v_row_shift(j + 1, key_lo, key_hi),
         )
-        acc = pgm.compute_pv(p, v, acc)
     j = pgm.tile_end - 1
     gl.amd.cdna4.async_copy.wait_group(1)
     _barrier()
