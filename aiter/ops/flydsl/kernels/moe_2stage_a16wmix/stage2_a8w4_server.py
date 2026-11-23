@@ -66,7 +66,13 @@ def _gather_requant_fp8_kernel(
     stid = tl.load(stids_ptr + r)
     token = stid & 0x00FFFFFF
     slot = (stid >> 24) & 0xFF
-    valid = token < M
+    # moe_sorting only fills [0, nvid0) (real routes + (M, topk) sentinels);
+    # the tail up to P is uninitialized torch.empty memory whose junk decodes
+    # to token < M with arbitrary slot bits (seen in-server: 5503/6432 junk
+    # tail entries masked by token < M alone). Without the slot check,
+    # canon = token*TOPK + slot reads inv_ptr past n*topk -> IMA at the
+    # scatter buffer's segment boundary (the server's HSA memory fault).
+    valid = (token < M) & (slot < TOPK)
     canon = token * TOPK + slot
     arow = tl.load(inv_ptr + canon, mask=valid, other=0).to(tl.int64)
     x = tl.load(
