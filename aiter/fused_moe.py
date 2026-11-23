@@ -55,6 +55,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
     parse_flydsl_v2_gemm2_kernel,
     parse_g2_kname_any,
 )
+from aiter.ops import moe_stage2_flydsl
 from aiter.ops.moe_mxfp4_aux import _mxfp4_moe_sort_internal_is_supported
 from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
@@ -5016,7 +5017,26 @@ def fused_moe_2stages(
         sorted_weights=stage2_sorted_weights,
         **extra_stage2_args,
     )
-    if _stage2_override is None:
+    if _stage2_override is None and moe_stage2_flydsl.available(
+        metadata.stage2,
+        expert_mask,
+        token_num,
+        stage2_args[0],
+        stage2_args[2],
+        stage2_kwargs,
+    ):
+        # FlyDSL prefill gemm2 (full scales in epilogue, Set-store to a
+        # bf16 workspace) + pure-sum topk reduce, instead of the CK atomic
+        # bf16 epilogue. See aiter/ops/moe_stage2_flydsl.py. Same-start
+        # interleaved A/B/A via AITER_CK_STAGE2_FLYDSL_CTRL; falls through
+        # to the production call when disabled.
+        _stage2_call = functools.partial(
+            moe_stage2_flydsl.stage2,
+            metadata.stage2,
+            stage2_args,
+            stage2_kwargs,
+        )
+    elif _stage2_override is None:
         _stage2_call = functools.partial(
             metadata.stage2,
             *stage2_args,
