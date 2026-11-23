@@ -1,5 +1,6 @@
 # The kernels in this file are adapted from vLLM:
 # https://github.com/vllm-project/vllm/blob/main/vllm/attention/ops/triton_unified_attention.py
+import os
 from typing import NamedTuple
 
 import torch
@@ -57,6 +58,8 @@ WARP_SIZE = 32 if IS_DEVICE_ARCH_GFX12 else 64
 
 _GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx950")
 
+# AITER_UA_SLIDING_DECODE_OPT=0 restores the double-buffered loop for sliding decode
+_SLIDING_DECODE_OPT = os.environ.get("AITER_UA_SLIDING_DECODE_OPT", "1") != "0"
 # LDS the gfx950 KV double buffer may occupy; a wider tile falls back to one buffer.
 _GFX950_LDS_BUDGET = 160 * 1024
 
@@ -1098,6 +1101,24 @@ def _unified_attention_gfx950(
     if 4 * TILE_SIZE * params.head_size * params.k.element_size() > _GFX950_LDS_BUDGET:
         NUM_BUFFERS = 1
 
+    # Sliding-window decode with one page per tile and more programs than two per CU: LDS
+    # holds only two double-buffered programs per CU, so run a single-buffer loop that
+    # overlaps the next tile's loads with the current tile's math (four programs per CU).
+    overlap = (
+        _SLIDING_DECODE_OPT
+        and params.all_decode
+        and params.sliding_window > 0
+        and NUM_SEGMENTS == 1
+        and TILE_SIZE == params.block_size
+        and not params.shuffled_kv_cache
+        and params.k.element_size() == 1
+        and params.k.stride() == params.v.stride()
+        and num_warps == 1
+        and params.num_2d_prgms > 2 * params.num_sms
+    )
+    if overlap:
+        NUM_BUFFERS = 1
+
     # buffer ops need the tensor to fit a 32-bit offset
     MAX_INT32 = 2**31 - 1
     USE_LOAD_BUFFER_OP = params.k.nelement() * params.k.element_size() <= MAX_INT32
@@ -1154,6 +1175,7 @@ def _unified_attention_gfx950(
         # useful for debugging when needed
         REMOVE_INDIRECT_ACCESS=False,
         NUM_BUFFERS=NUM_BUFFERS,
+        OVERLAP=overlap,
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         KV_SHUFFLE_WIDTH=params.k_width,
         NUM_SPLITS=NUM_SEGMENTS,
