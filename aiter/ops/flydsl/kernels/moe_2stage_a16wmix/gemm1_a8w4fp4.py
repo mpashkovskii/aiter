@@ -113,10 +113,12 @@ def _fp4w_win_to_fp8x8(raw_i32, cb16_i32):
     sgn_o = raw_i32 & fx.Int32(0x80808080)
     codes_e = _fp8_synth_half(sel_e, sgn_e, cb16_i32)  # fp8 of k 0,2,4,6
     codes_o = _fp8_synth_half(sel_o, sgn_o, cb16_i32)  # fp8 of k 1,3,5,7
-    # interleave byte-wise: out0 = [e0,o0,e1,o1], out1 = [e2,o2,e3,o3]
+    # interleave byte-wise (v_perm_b32 selectors are ONE BYTE PER OUTPUT BYTE,
+    # valid range 0..7 across the two source regs; >7 yields 0xFF):
+    # out0 = [e0,o0,e1,o1] -> sel bytes [0,4,1,5]; out1 = [e2,o2,e3,o3] -> [2,6,3,7]
     return [
-        _perm_b32(codes_o, codes_e, fx.Int32(0x5140)),
-        _perm_b32(codes_o, codes_e, fx.Int32(0x7362)),
+        _perm_b32(codes_o, codes_e, fx.Int32(0x05010400)),
+        _perm_b32(codes_o, codes_e, fx.Int32(0x07030602)),
     ]
 
 
