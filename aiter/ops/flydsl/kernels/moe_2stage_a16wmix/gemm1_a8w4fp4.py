@@ -419,6 +419,9 @@ def _gemm1_body_a8w4fp4(
                     _c = fx.Int32(dbg_bconst)
                     bg = _fp8_frag8([_c, _c])
                     bu = _fp8_frag8([_c, _c])
+                elif const_expr(dbg_braw):
+                    bg = _fp8_frag8([rg[ku], rg[ku]])
+                    bu = _fp8_frag8([ru[ku], ru[ku]])
                 else:
                     bg = _fp8_frag8(_fp4w_win_to_fp8x8(rg[ku], cg[ku]))
                     bu = _fp8_frag8(_fp4w_win_to_fp8x8(ru[ku], cu[ku]))
@@ -514,6 +517,7 @@ def compile_gemm1_a8w4fp4(
     act="silu_clamp",
     waves_per_eu=None,
     dbg_bconst=0,
+    dbg_braw=0,
     rocm_arch,
 ):
     """a8w4-FP4W (fp8 A x native mxfp4 W1, in-register fp8 synth) MoE stage1.
@@ -550,6 +554,8 @@ def compile_gemm1_a8w4fp4(
         _name += f"_w{waves_per_eu}"
     if dbg_bconst:
         _name += f"_dbc{dbg_bconst:x}"
+    if dbg_braw:
+        _name += "_dbraw"
 
     @fx.struct
     class SharedStorage:
