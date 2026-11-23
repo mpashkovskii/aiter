@@ -132,7 +132,6 @@ def kernel_unified_attention_2d(
     SHUFFLED_KV_CACHE: tl.constexpr = False,  # bool
     SPLIT_UNMASKED_LOOP: tl.constexpr = False,  # bool
     K_WIDTH: tl.constexpr = 0,  # int
-    FAST_SW_MASK: tl.constexpr = False,  # bool
 ):
     # SPLIT_UNMASKED_LOOP does not support SHUFFLED_KV_CACHE or SLIDING_WINDOW.
     tl.static_assert(
@@ -471,31 +470,18 @@ def kernel_unified_attention_2d(
             # softcap here uses exp2 and consumes RCP_LN2 conversion.
             # multiply by RCP_LN2 again to be used in later exp2
             S = apply_softcap(S, softcap) * RCP_LN2
-        if FAST_SW_MASK:
-            # Causal and window masks in one unsigned compare: key in [q_abs - W + 1, q_abs]
-            # <=> 0 <= key - (q_abs - W + 1) < W. Rows past the query length are not masked
-            # (their output is never stored).
-            lo_key = context_len + query_pos - (SLIDING_WINDOW - 1)
+        seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
+
+        S = tl.where(
+            query_mask_1[:, None] & query_mask_0[:, None] & seq_mask, S, float("-inf")
+        )
+
+        if SLIDING_WINDOW > 0:
             S = tl.where(
-                (seq_offset[None, :] - lo_key[:, None]).to(tl.uint32) < SLIDING_WINDOW,
+                (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW,
                 S,
                 float("-inf"),
             )
-        else:
-            seq_mask = seq_offset[None, :] < context_len + query_pos[:, None] + 1
-
-            S = tl.where(
-                query_mask_1[:, None] & query_mask_0[:, None] & seq_mask,
-                S,
-                float("-inf"),
-            )
-
-            if SLIDING_WINDOW > 0:
-                S = tl.where(
-                    (context_len + query_pos[:, None] - seq_offset) < SLIDING_WINDOW,
-                    S,
-                    float("-inf"),
-                )
 
         if USE_ALIBI_SLOPES:
             # prescale w. RCP_LN2 for later exp2
