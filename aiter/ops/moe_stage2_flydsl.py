@@ -165,10 +165,40 @@ def available(stage2_partial, expert_mask, token_num, inter_states, w2, kwargs):
     )
 
 
+_debug_state = {"logged": None}
+
+
+def _debug(enabled, token_num, block_m=None):
+    """Engagement audit for in-server A/B/A (AITER_CK_STAGE2_FLYDSL_DEBUG=1):
+    one line per control-state change per worker, so a serve.log window shows
+    ENGAGED/FALLBACK-OFF with the shape that triggered it.  Called only where
+    the eager prefill path dispatches, so markers are per-call live even under
+    CUDA-graph execution of the decode steps (which this module never takes:
+    the contract gate is token_num >= 2048)."""
+    if os.environ.get("AITER_CK_STAGE2_FLYDSL_DEBUG", "0") not in (
+        "1",
+        "true",
+        "True",
+    ):
+        return
+    if _debug_state["logged"] == enabled:
+        return
+    _debug_state["logged"] = enabled
+    if enabled:
+        print(
+            f"[moe_stage2_flydsl] ENGAGED token_num={token_num} block_m={block_m}",
+            flush=True,
+        )
+    else:
+        print(f"[moe_stage2_flydsl] FALLBACK-OFF token_num={token_num}", flush=True)
+
+
 def stage2(metadata_stage2, stage2_args, stage2_kwargs):
     """Runtime control-file toggle: fall through to the production call when
     disabled (same-start interleaved A/B/A without a server restart)."""
     if not _enabled():
+        token_num = int(stage2_args[0].shape[0])
+        _debug(False, token_num)
         return metadata_stage2(*stage2_args, **stage2_kwargs)
 
     (
@@ -188,6 +218,8 @@ def stage2(metadata_stage2, stage2_args, stage2_kwargs):
 
     token_num, _topk, inter_dim = inter_states.shape
     E, model_dim, _K = w2.shape
+
+    _debug(True, token_num, block_m)
 
     n_blocks = int(sorted_expert_ids.shape[0])
     gemm2_out = torch.empty(
