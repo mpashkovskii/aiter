@@ -43,6 +43,31 @@ from aiter import QuantType
 _ENABLED = os.environ.get("AITER_CK_STAGE2_TWOPASS", "1") == "1"
 _MIN_TOKENS = int(os.environ.get("AITER_CK_STAGE2_TWOPASS_MIN_TOKENS", "2048"))
 
+# Runtime control file for same-start A/B/A experiments: if the file named by
+# AITER_CK_STAGE2_TWOPASS_CTRL (default /tmp/aiter_stage2_twopass.enabled)
+# exists, its content ("1"/"0") wins over the env default.  Reloaded on mtime
+# change only, so steady-state cost is one stat() per MoE call.
+_CTRL = os.environ.get(
+    "AITER_CK_STAGE2_TWOPASS_CTRL", "/tmp/aiter_stage2_twopass.enabled"
+)
+_ctrl_state = {"mtime": None, "on": True}
+
+
+def _enabled() -> bool:
+    try:
+        m = os.stat(_CTRL).st_mtime_ns
+    except OSError:
+        return _ENABLED
+    if m != _ctrl_state["mtime"]:
+        try:
+            with open(_CTRL) as f:
+                _ctrl_state["on"] = f.read().strip().lower() not in (
+                    "0", "off", "false", "")
+        except OSError:
+            _ctrl_state["on"] = _ENABLED
+        _ctrl_state["mtime"] = m
+    return _ctrl_state["on"]
+
 _IDENTITY_CACHE: dict = {}
 
 
@@ -135,7 +160,7 @@ def _twopass_fold(WS, INV, C, EPR, W2S, OUT,
 def available(stage2_callable, expert_mask, token_num, model_dim,
               sorted_weights, a2, w2) -> bool:
     """Gate the two-pass path: CK stage2, per-token fp8, no EP, large enough."""
-    if not _ENABLED:
+    if not _enabled():
         return False
     func = getattr(stage2_callable, "func", stage2_callable)
     if func is not aiter.ck_moe_stage2_fwd:
