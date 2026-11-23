@@ -3868,6 +3868,11 @@ def get_2stage_cfgs(
                 else get_block_size_M(token, topk, expert, inter_dim)
             )
         )
+        # iter-14: FlyDSL stage2 contract is occupancy-limited at block_m=128
+        # for token in [2048, 4096); see aiter(ops)/moe_stage2_flydsl.py.
+        block_m = moe_stage2_flydsl.dispatch_block_m(
+            token, q_type, q_dtype_a, q_dtype_w, dtype, run_1stage, is_ep, block_m
+        )
         ksplit = (
             ksplit
             if (run_1stage)

@@ -118,6 +118,34 @@ def _supported_operands(inter_states, w2, sorted_weights, w2_scale, a2_scale):
     )
 
 
+def dispatch_block_m(
+    token, q_type, q_dtype_a, q_dtype_w, dtype, run_1stage, is_ep, block_m
+):
+    """iter-14: for the FlyDSL stage2 contract (a8w8 fp8 per_Token on gfx942,
+    EP-free, 2-stage) the prefill_1x4 gemm2 is occupancy-limited at
+    block_m=128 when token is in [2048, 4096) (64 expert blocks << 304 CUs);
+    block_m=64 wins the whole pipeline (measured full-fwd at T=2048: ~440 vs
+    ~520 us; CK stage1 is block-agnostic at that size: 212.4 vs 217.0 us).
+    Only touches the sorting/stage1 block choice for the contract this module
+    replaces; AITER_CK_STAGE2_FLYDSL=0 keeps the stock heuristic."""
+    if (
+        _enabled()
+        and not run_1stage
+        and not is_ep
+        and 2048 <= token < 4096
+        and block_m == 128
+        and q_type == aiter.QuantType.per_Token
+        and q_dtype_a == aiter.dtypes.fp8
+        and q_dtype_w == aiter.dtypes.fp8
+        and dtype == aiter.dtypes.bf16
+    ):
+        from aiter.jit.utils.chip_info import get_gfx
+
+        if get_gfx() == "gfx942":
+            return 64
+    return block_m
+
+
 def available(stage2_partial, expert_mask, token_num, inter_states, w2, kwargs):
     """Dispatch-time gate. Only replaces the production ck_moe_stage2_fwd call
     (including its tuned-CSV instance replacements) for the contract we have
