@@ -27,6 +27,7 @@ from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import (
 from aiter.ops.flydsl.kernels.gemm_a8w8_8wave_gelu_mx import (
     Mfma16x16x128,
     S2RLoader,
+    StoreActBF16,
     StoreActMX,
 )
 from aiter.ops.flydsl.kernels.kernels_common import ceildiv
@@ -121,18 +122,33 @@ class StoreActMXDec(StoreActMX):
         fx.copy(self.sc_atom, reg1, fx.slice(self.sc_div, (None, sc_i)))
 
 
+class StoreActBF16Dec(StoreActBF16):
+    """StoreActBF16 for HID = 160 (the up half of the interleaved scale vector starts HID columns after the gate half)."""
+
+    def prefetch(self, base_row, half_rows, wcol0):
+        l16 = self.lane_id % 16
+        sa = [
+            [self._sa_scalar(base_row + h * half_rows + ti * 16 + l16) for ti in range_constexpr(self.n_tiles_a)]
+            for h in range_constexpr(2)
+        ]
+        sb = [self._sb_vec4(wcol0), self._sb_vec4(wcol0 + 4), self._sb_vec4(wcol0 + HID), self._sb_vec4(wcol0 + HID + 4)]
+        self.pre = (sa, sb)
+
+
 def compile_gate_up_gelu_mx_dec(
     *,
     K: int,
     waves_per_eu: int = 3,
     rows_scales: bool = False,
     ws_layout: bool = False,
+    bf16_out: bool = False,
 ):
     assert K % BLOCK_K == 0 and K >= 2 * BLOCK_K
+    assert not (bf16_out and (rows_scales or ws_layout))
     K_ITERS = K // BLOCK_K
     N_ACCUMS = N_TILES_A * N_TILES_B
 
-    _kname = f"flydsl_gelumx_dec_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_F8_F8_F8_w{N_WAVES}_{waves_per_eu}{'r' if rows_scales else ''}{'w' if ws_layout else ''}_k{K}"
+    _kname = f"flydsl_gelumx_dec_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_F8_F8_F8_w{N_WAVES}_{waves_per_eu}{'r' if rows_scales else ''}{'w' if ws_layout else ''}{'_bf16' if bf16_out else ''}_k{K}"
 
     @fx.struct
     class SharedStorage:
@@ -204,7 +220,10 @@ def compile_gate_up_gelu_mx_dec(
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
-        store_c = StoreActMXDec(A_scale, B_scale, C, SC, c_m, c_n, mfma.idx, N_TILES_A, rows_layout=rows_scales, ws_layout=ws_layout)
+        if const_expr(bf16_out):
+            store_c = StoreActBF16Dec(A_scale, B_scale, C, SC, c_m, c_n, mfma.idx, N_TILES_A)
+        else:
+            store_c = StoreActMXDec(A_scale, B_scale, C, SC, c_m, c_n, mfma.idx, N_TILES_A, rows_layout=rows_scales, ws_layout=ws_layout)
 
         c00_frag = [mfma.zero_value] * N_ACCUMS
         c01_frag = [mfma.zero_value] * N_ACCUMS
