@@ -231,6 +231,7 @@ def flydsl_a16w4_gemm1(
     k_batch=1,
     k_wave=1,
     b_nt=None,
+    a_nt=None,
     xcd_swizzle=0,
     gate_mode="separated",
     act="silu",
@@ -278,6 +279,10 @@ def flydsl_a16w4_gemm1(
     # Tile config is fully CSV/registry-driven: the caller resolves tile_n/tile_k/
     # k_wave/b_nt/xcd_swizzle from the tuned kernelName1 and always passes them.
     b_cache_mod = 2 if b_nt is None else b_nt
+    # a_nt: A (activation) DMA cache modifier (None/2 = streaming, 0 = cached).
+    # A rows are re-read once per N-block, so caching pays off at small
+    # NUM_N_BLOCKS shapes like the unpadded DSV4.1 G1 (3 blocks at tn192).
+    a_cache_mod = 2 if a_nt is None else a_nt
     if D_HIDDEN % TILE_K != 0:
         raise NotImplementedError(
             f"a16w4 gemm1 requires D_HIDDEN (K) % {TILE_K} == 0, got H={D_HIDDEN}"
@@ -303,6 +308,7 @@ def flydsl_a16w4_gemm1(
         TILE_K=TILE_K,
         act=act,
         b_cache_mod=b_cache_mod,
+        a_cache_mod=a_cache_mod,
         xcd_swizzle=xcd_swizzle,
         waves_per_eu=waves_per_eu,
         w_dtype=w_dtype,

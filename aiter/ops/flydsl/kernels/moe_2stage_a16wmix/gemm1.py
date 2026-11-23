@@ -53,6 +53,7 @@ def _gemm1_body_a16w4(
     TOPK,
     act="silu",
     b_cache_mod=2,
+    a_cache_mod=2,
     w_dtype="fp4",
     w_layout="standard",
     k_wave=1,
@@ -172,7 +173,7 @@ def _gemm1_body_a16w4(
         a_num_bytes=fx.Int64(i32_ntok) * fx.Int64(c_k_div4) * fx.Int64(4),
         a_load_threads=a_load_threads,
         row_base_dwords=_a_row_base_dwords,
-        dma_cache_mod=2,
+        dma_cache_mod=a_cache_mod,
         dma_via_vgpr=_is_gfx942,
         k_grp_base_bytes=k_grp_base_bytes,
         A_SLOT_BYTES=A_SLOT_BYTES,
@@ -387,6 +388,7 @@ def compile_gemm1_a16w4_port(
     TILE_K=256,
     act="silu",
     b_cache_mod=2,
+    a_cache_mod=2,
     xcd_swizzle=0,
     waves_per_eu=None,
     w_dtype="fp4",
@@ -479,12 +481,13 @@ def compile_gemm1_a16w4_port(
     ), f"a16w4 gemm1 act must be 'silu', 'silu_clamp', 'swiglu', or 'situv2', got {act!r}"
     _act_tag = "" if act == "silu" else f"_{act}"
     _bcm_tag = "" if b_cache_mod == 2 else f"_bcm{b_cache_mod}"
+    _acm_tag = "" if a_cache_mod == 2 else f"_acm{a_cache_mod}"
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     _wpe_tag = f"_w{waves_per_eu}" if waves_per_eu else ""
     _wd_tag = "" if w_dtype == "fp4" else f"_{w_dtype}"
     _wl_tag = "" if w_layout == "standard" else f"_{w_layout}"
     _kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
-    name_suffix = f"a16w4{_wd_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}_tn{TILE_N}{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}"
+    name_suffix = f"a16w4{_wd_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}_tn{TILE_N}{_act_tag}{_bcm_tag}{_acm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}"
 
     @fx.struct
     class SharedStorage:
@@ -575,6 +578,7 @@ def compile_gemm1_a16w4_port(
                 TOPK=TOPK,
                 act=act,
                 b_cache_mod=b_cache_mod,
+                a_cache_mod=a_cache_mod,
                 w_dtype=w_dtype,
                 w_layout=w_layout,
                 k_wave=k_wave,
