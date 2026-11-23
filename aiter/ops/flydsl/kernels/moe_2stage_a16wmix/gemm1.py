@@ -470,9 +470,10 @@ def compile_gemm1_a16w4_port(
 
     assert act in (
         "silu",
+        "silu_clamp",
         "swiglu",
         "situv2",
-    ), f"a16w4 gemm1 act must be 'silu', 'swiglu', or 'situv2', got {act!r}"
+    ), f"a16w4 gemm1 act must be 'silu', 'silu_clamp', 'swiglu', or 'situv2', got {act!r}"
     _act_tag = "" if act == "silu" else f"_{act}"
     _bcm_tag = "" if b_cache_mod == 2 else f"_bcm{b_cache_mod}"
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
@@ -538,7 +539,7 @@ def compile_gemm1_a16w4_port(
             else:
                 _tile = bx_i32
             # Runtime activation scalars; plain silu ignores them.
-            if const_expr(act in ("swiglu", "situv2")):
+            if const_expr(act in ("swiglu", "situv2", "silu_clamp")):
                 _situ = situ_params(
                     fx.Float32(f32_situ_beta),
                     fx.Float32(f32_situ_beta_rcp),
