@@ -434,24 +434,13 @@ def _fp4_nibble_to_bf16x8(raw_i32, scale_f32):
     E8M0 is a power of two; scale is applied on f32, then packed with the same
     lshr-16 used by gfx942 int4.
     """
+    # TIMING-ONLY PROBE iter-18 (numerics garbage, DO NOT COMMIT as product):
+    # skip the e2m1 decode+scale chain to bound the MMA+I/O time without the
+    # graphics-pipeline VALU tax.
     packed = fx.Int32(raw_i32)
-    even = packed & fx.Int32(0x0F0F0F0F)  # K0,K2,K4,K6
-    odd = packed.shrui(fx.Int32(4)) & fx.Int32(0x0F0F0F0F)  # K1,K3,K5,K7
-    fe = _fp4x4_e2m1_to_f32x4(even)
-    fo = _fp4x4_e2m1_to_f32x4(odd)
     scale = fx.Float32(scale_f32)
-    f32s = []
-    for i in range_constexpr(4):
-        f32s.append(fe[i] * scale)
-        f32s.append(fo[i] * scale)
-    c16 = fx.Int32(16)
-    hi16 = fx.Int32(0xFFFF0000)
-    i32s = []
-    for i in range_constexpr(4):
-        b0 = f32s[2 * i].bitcast(fx.Int32)
-        b1 = f32s[2 * i + 1].bitcast(fx.Int32)
-        i32s.append(b0.shrui(c16) | (b1 & hi16))
-    v4i32 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
+    _ = scale
+    v4i32 = fx.Vector.from_elements([_raw(packed) for _ in range_constexpr(4)], fx.Int32)
     return v4i32.bitcast(fx.BFloat16)
 
 
