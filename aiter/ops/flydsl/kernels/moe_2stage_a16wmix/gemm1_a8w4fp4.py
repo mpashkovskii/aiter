@@ -435,7 +435,7 @@ def _gemm1_body_a8w4fp4(
                         _raw(
                             (
                                 (i32_out_rows + kt * k_unroll + ku) * inter_i32
-                                + col_g_list[ni]
+                                + col_g_i32[ni]
                             )
                         ),
                     )
