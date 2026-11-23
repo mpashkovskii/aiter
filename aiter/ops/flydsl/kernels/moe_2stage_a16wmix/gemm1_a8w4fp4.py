@@ -407,12 +407,11 @@ def _gemm1_body_a8w4fp4(
             for mi in range_constexpr(m_repeat)
         ]
 
-    def compute_tile(b_tile, a_frags):
+    def compute_tile(b_tile, a_frags, kt):
         # b_tile = [gate_per_ni, up_per_ni]; per ni: (raw_pairs, cb16s), one
         # per K32i (k_unroll of them laid out by load_b_pair: 2 per 64-K tile
         # -> k_unroll == 2 at tk64; generalize: pair h covers K32i kt*ku + h).
         b_g, b_u = b_tile
-        _dbg_codes = {}
         for ni in range_constexpr(num_acc_n):
             rg, cg = b_g[ni]
             ru, cu = b_u[ni]
@@ -427,12 +426,30 @@ def _gemm1_body_a8w4fp4(
                 else:
                     bg = _fp8_frag8(_fp4w_win_to_fp8x8(rg[ku], cg[ku]))
                     bu = _fp8_frag8(_fp4w_win_to_fp8x8(ru[ku], cu[ku]))
+                if const_expr(dbg_bdump):
+                    _codes = _fp4w_win_to_fp8x8(rg[ku], cg[ku])
+                    _byte0 = _codes[0] & fx.Int32(0xFF)
+                    buffer_ops.buffer_store(
+                        fx.Float32(_byte0).to(fx.BFloat16),
+                        _raw(dump_rsrc),
+                        _raw(
+                            (
+                                (i32_out_rows + kt * k_unroll + ku) * inter_i32
+                                + col_g_list[ni]
+                            )
+                            * fx.Int32(2)
+                        ),
+                    )
                 for mi in range_constexpr(m_repeat):
                     aa = _fp8_frag8(a_frags[mi][ku])
                     fx.gemm(mma_atom, acc_gate[mi][ni], aa, bg, acc_gate[mi][ni])
                     fx.gemm(mma_atom, acc_up[mi][ni], aa, bu, acc_up[mi][ni])
 
     # ---- main K loop (iter-17 software pipeline, a_stages deep) -------------
+    dump_rsrc = buffer_ops.create_buffer_resource_from_addr(
+        _raw(fx.Int64(arg_out)),
+        num_records_bytes=fx.Int64(1 << 31),
+    )
     for s in range_constexpr(A_STAGES - 1):
         if const_expr(s < K_TILES_TOTAL):
             store_a_tile(s * TILE_K, s)
@@ -446,7 +463,7 @@ def _gemm1_body_a8w4fp4(
             store_a_tile((kt + A_STAGES - 1) * TILE_K, (kt + A_STAGES - 1) % A_STAGES)
         if const_expr(kt + 1 < K_TILES_TOTAL):
             b_nxt = load_b_tile(kt + 1)
-        compute_tile(b_cur, a_frags)
+        compute_tile(b_cur, a_frags, kt)
         if const_expr(kt + 1 < K_TILES_TOTAL):
             b_cur = b_nxt
 
@@ -520,6 +537,7 @@ def compile_gemm1_a8w4fp4(
     waves_per_eu=None,
     dbg_bconst=0,
     dbg_braw=0,
+    dbg_bdump=0,
     rocm_arch,
 ):
     """a8w4-FP4W (fp8 A x native mxfp4 W1, in-register fp8 synth) MoE stage1.
@@ -558,6 +576,8 @@ def compile_gemm1_a8w4fp4(
         _name += f"_dbc{dbg_bconst:x}"
     if dbg_braw:
         _name += "_dbraw"
+    if dbg_bdump:
+        _name += "_dbdump"
 
     @fx.struct
     class SharedStorage:
@@ -658,6 +678,7 @@ def compile_gemm1_a8w4fp4(
                 rocm_arch=rocm_arch,
                 dbg_bconst=dbg_bconst,
                 dbg_braw=dbg_braw,
+                dbg_bdump=dbg_bdump,
             )
 
     @flyc.jit
