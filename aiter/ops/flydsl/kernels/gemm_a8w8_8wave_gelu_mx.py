@@ -137,8 +137,7 @@ class StoreActMX:
         self.one = Vec.filled(8, fx.Float32(1.0), fx.Float32)
         self.es = [None] * self.n_tiles_a
 
-    def epi_one(self, ti, c_gate, c_up, half, base_row, hid_col0):
-        l16 = self.lane_id % 16
+    def _act(self, ti, c_gate, c_up, half):
         sa_regs, _ = self.pre
         sbg0, sbg1, sbu0, sbu1 = self.sbg0, self.sbg1, self.sbu0, self.sbu1
         sa = Vec.filled(4, Vec(fx.memref_load_vec(sa_regs[half][ti]))[0], fx.Float32)
@@ -148,7 +147,11 @@ class StoreActMX:
         ee = [fx.Float32(rocdl.exp2(T.f32, _raw(z[i]))) for i in range_constexpr(8)]
         d = Vec.from_elements(ee, dtype=fx.Float32) + self.one
         rr = [fx.Float32(rocdl.rcp(T.f32, _raw(d[i]))) for i in range_constexpr(8)]
-        act = g * Vec.from_elements(rr, dtype=fx.Float32) * u
+        return g * Vec.from_elements(rr, dtype=fx.Float32) * u
+
+    def epi_one(self, ti, c_gate, c_up, half, base_row, hid_col0):
+        l16 = self.lane_id % 16
+        act = self._act(ti, c_gate, c_up, half)
         m = fx.max(act[0], -act[0])
         for i in range_constexpr(1, 8):
             m = fx.max(m, fx.max(act[i], -act[i]))
@@ -188,6 +191,40 @@ class StoreActMX:
         n1 = base_row // 32 + grp // 2
         sc_i = ((n1 * self.k1_stride + sc_k1) * 64 + sc_l0 + l16) * 4 + sc_kp * 2 + (grp % 2)
         fx.copy(self.sc_atom, reg1, fx.slice(self.sc_div, (None, sc_i)))
+
+
+class StoreActBF16(StoreActMX):
+    """Epilogue variant of StoreActMX that stores act = gelu_tanh(gate) * up as bf16 [M, N/2] (row-major, 16 B per lane)
+    instead of quantizing it: for a down projection that stays bf16. No scale bytes are written."""
+
+    def __init__(self, A_scale, B_scale, C, SC, c_rows, c_cols, c_idx_fn, n_tiles_a):
+        self.c_rows = c_rows
+        self.out_cols = c_cols // 2
+        self.lane_id = fx.thread_idx.x % 64
+        self.c_idx_fn = c_idx_fn
+        self.n_tiles_a = n_tiles_a
+        gC = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=c_rows * c_cols)
+        gSA = fx.rocdl.make_buffer_tensor(A_scale, max_size=False, num_records_bytes=c_rows * 4)
+        gSB = fx.rocdl.make_buffer_tensor(B_scale, max_size=False, num_records_bytes=c_cols * 4)
+        self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
+        self.sa_div = fx.logical_divide(gSA, fx.make_layout(1, 1))
+        self.sb_div = fx.logical_divide(gSB, fx.make_layout(1, 1))
+        self.scale_atom_4 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
+        self.scale_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+        self.out_atom_8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
+        self.pre = None
+
+    def epi_one(self, ti, c_gate, c_up, half, base_row, hid_col0):
+        l16 = self.lane_id % 16
+        act = self._act(ti, c_gate, c_up, half)
+        outs = [act[i].to(fx.BFloat16) for i in range_constexpr(8)]
+        reg8 = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
+        fx.memref_store_vec(fx.Vector.from_elements(outs, fx.BFloat16), reg8)
+        row = base_row + ti * 16 + l16
+        fx.copy(self.out_atom_8, reg8, fx.slice(self.c_div, (None, self._out_index(row, hid_col0))))
+
+    def epi_scales(self, *args):
+        pass
 
 
 class Mfma16x16x128:
@@ -270,6 +307,7 @@ def compile_fp8_gemm_8w_gelu_mx(
     b_preshuffled: bool = False,
     waves_per_eu: int = 2,
     xcd_swizzle: int = 0,
+    bf16_out: bool = False,
 ):
     BLOCK_K = 128
 
@@ -301,6 +339,8 @@ def compile_fp8_gemm_8w_gelu_mx(
         f"flydsl_gelumx_8w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_F8_F8_F8_"
         f"{waves_per_eu}x{xcd_swizzle}_k{K}"
     )
+    if bf16_out:
+        _kname = _kname.replace("_F8_F8_F8_", "_F8_F8_B16_").replace("gelumx", "gelubf")
 
     @fx.struct
     class SharedStorage:
@@ -373,7 +413,7 @@ def compile_fp8_gemm_8w_gelu_mx(
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
-        store_c = StoreActMX(A_scale, B_scale, C, SC, c_m, c_n, mfma.idx, N_TILES_A)
+        store_c = (StoreActBF16 if bf16_out else StoreActMX)(A_scale, B_scale, C, SC, c_m, c_n, mfma.idx, N_TILES_A)
 
         # 2x2 config of 4x2 (instead of 4x4 in 4wave) 16x16 sub-tiles
         c00_frag = [mfma.zero_value] * N_ACCUMS

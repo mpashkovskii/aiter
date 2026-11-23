@@ -97,6 +97,22 @@ def _compile_gate_up(k: int, waves_per_eu: int, xcd_swizzle: int):
 
 
 @functools.lru_cache(maxsize=64)
+def _compile_gate_up_bf16(k: int, waves_per_eu: int, xcd_swizzle: int):
+    _lazy_import()
+    from .kernels.gemm_a8w8_8wave_gelu_mx import compile_fp8_gemm_8w_gelu_mx
+
+    return compile_fp8_gemm_8w_gelu_mx(
+        K=k,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        b_preshuffled=True,
+        waves_per_eu=waves_per_eu,
+        xcd_swizzle=xcd_swizzle,
+        bf16_out=True,
+    )
+
+
+@functools.lru_cache(maxsize=64)
 def _compile_down(k: int, waves_per_eu: int, xcd_swizzle: int):
     _lazy_import()
     from .kernels.mxfp8_gemm_8wave_chan import compile_mxfp8_gemm_8w_chan
@@ -148,6 +164,51 @@ def flydsl_gate_up_gelu_mx(
         x_scale.reshape(-1).contiguous().to(torch.float32),
         w_scale,
         _i8(out_scale).view(-1),
+        m,
+        n,
+        _fx.Stream(torch.cuda.current_stream(device=XQ.device)),
+    )
+
+
+_NO_SCALE: dict = {}
+
+
+def _no_scale(device: torch.device) -> Tensor:
+    t = _NO_SCALE.get(device)
+    if t is None:
+        t = torch.zeros(256, dtype=torch.int8, device=device)
+        _NO_SCALE[device] = t
+    return t
+
+
+def flydsl_gate_up_gelu_bf16(
+    XQ: Tensor,
+    W: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    *,
+    waves_per_eu: int = 3,
+    xcd_swizzle: int = 2,
+) -> None:
+    """``flydsl_gate_up_gelu_mx`` with a bf16 epilogue: writes ``out`` ``[M, N/2]`` bf16 = gelu_tanh(gate) * up (no
+    quantization, no scales), for a down projection that stays bf16."""
+    _lazy_import()
+    m, k = XQ.shape
+    n = W.shape[0]
+    if not is_supported_shape(m, n, k):
+        raise ValueError(f"[FlyDSL gelu_bf16] unsupported shape M={m} N={n} K={k}")
+    if tuple(out.shape) != (m, n // 2) or out.dtype != torch.bfloat16 or not out.is_contiguous():
+        raise ValueError("[FlyDSL gelu_bf16] out must be a contiguous bf16 [M, N/2]")
+    exe = _compile_gate_up_bf16(k, waves_per_eu, xcd_swizzle)
+    _run_compiled(
+        exe,
+        _i8(XQ.contiguous()).view(-1),
+        _i8(W).view(-1),
+        out.view(-1),
+        x_scale.reshape(-1).contiguous().to(torch.float32),
+        w_scale,
+        _no_scale(XQ.device),
         m,
         n,
         _fx.Stream(torch.cuda.current_stream(device=XQ.device)),
@@ -260,3 +321,43 @@ def flydsl_gate_up_gelu_mx_dec(
         _fx.Stream(torch.cuda.current_stream(device=XQ.device)),
     )
 
+
+
+@functools.lru_cache(maxsize=8)
+def _compile_gate_up_dec_bf16(k: int, waves_per_eu: int):
+    _lazy_import()
+    from .kernels.gemm_a8w8_gelu_mx_dec import compile_gate_up_gelu_mx_dec
+
+    return compile_gate_up_gelu_mx_dec(K=k, waves_per_eu=waves_per_eu, bf16_out=True)
+
+
+def flydsl_gate_up_gelu_bf16_dec(
+    XQ: Tensor,
+    W: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor,
+    *,
+    waves_per_eu: int = 3,
+) -> None:
+    """Decode-size (M <= 256) ``flydsl_gate_up_gelu_bf16``: W from ``prepare_gate_up_weight_dec``; ``out`` ``[M, N/2]`` bf16."""
+    _lazy_import()
+    m, k = XQ.shape
+    n = W.shape[0]
+    if m > 256 or k % BLOCK_K != 0 or k < 2 * BLOCK_K or (n // 2) % HID_DEC != 0:
+        raise ValueError(f"[FlyDSL gelu_bf16 dec] unsupported shape M={m} N={n} K={k}")
+    if tuple(out.shape) != (m, n // 2) or out.dtype != torch.bfloat16 or not out.is_contiguous():
+        raise ValueError("[FlyDSL gelu_bf16 dec] out must be a contiguous bf16 [M, N/2]")
+    exe = _compile_gate_up_dec_bf16(k, waves_per_eu)
+    _run_compiled(
+        exe,
+        _i8(XQ.contiguous()).view(-1),
+        _i8(W).view(-1),
+        out.view(-1),
+        x_scale.reshape(-1).contiguous().to(torch.float32),
+        w_scale,
+        _no_scale(XQ.device),
+        m,
+        n,
+        _fx.Stream(torch.cuda.current_stream(device=XQ.device)),
+    )
