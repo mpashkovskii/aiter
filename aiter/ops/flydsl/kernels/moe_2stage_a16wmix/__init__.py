@@ -27,19 +27,24 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from .gemm1 import compile_gemm1_a16w4_port, gemm1_a16w4_grid
 from .gemm2 import compile_gemm2_a16w4_port, gemm2_a16w4_grid
 from .gemm2_a8w4 import compile_gemm2_a8w4, gemm2_a8w4_grid
+from .gemm1_a8w4fp4 import compile_gemm1_a8w4fp4, gemm1_a8w4fp4_grid
 
 __all__ = [
     "compile_gemm1_a16w4_port",
     "compile_gemm2_a16w4_port",
     "compile_gemm2_a8w4",
+    "compile_gemm1_a8w4fp4",
     "flydsl_a16w4_gemm1",
     "flydsl_a16w4_gemm2",
     "flydsl_a8w4_gemm2",
+    "flydsl_a8w4fp4_gemm1",
     "gemm1_a16w4_grid",
     "gemm2_a16w4_grid",
     "gemm2_a8w4_grid",
+    "gemm1_a8w4fp4_grid",
     "requant_w2_to_fp8col",
     "repack_w13_pairwise_to_a16w4_shuffled",
+    "repack_w13_pairwise_to_a8w4fp4",
     "requant_a_to_fp8",
     "gather_requant_fp8",
     "moe_stage2_a8w4_forward",
@@ -180,6 +185,76 @@ def repack_w13_pairwise_to_a16w4_shuffled(w1_ktr, w1_scale_ktr, inter_real):
     w_shuf = shuffle_weight_a16w4(w_plain, 16, False)
     s_shuf = shuffle_scale_a16w4(s_plain.view(E * 2 * I, k_scale), E, False)
     return w_shuf, s_shuf
+
+
+def repack_w13_pairwise_to_a8w4fp4(w1_ktr, w1_scale_ktr, inter_real):
+    """DeepSeek-V4.1 production w13 pairwise fp4 G1 -> a8w4-FP4W stage1 inputs.
+
+    Same reorientation as :func:`repack_w13_pairwise_to_a16w4_shuffled`
+    (pairwise gate/up rows -> GGUU over the REAL 2*inter_real columns, layout
+    only, fp4 bytes untouched) but for the fp8-synthesis kernel
+    (:mod:`.gemm1_a8w4fp4`): plain per-(column, group) e8m0 scale plane, the
+    per-column exponent shift and the fp32 epilog scale, with semantics
+    identical to :func:`requant_w2_to_fp8col` (value = mag * 2^(raw - shift),
+    s_w = 2^(shift - 127)) -- so the in-register fp8 bytes are bit-exact vs
+    the iter-17 offline cache (proven in microbench/fp8byte_sim.py).
+
+    Returns ``(w_shuf, sc_u8, shift_u8, sw_f32)``:
+      w_shuf:   (E, 2*I, K/2-bytes) shuffle_weight_a16w4 (16, gate_up=False),
+      sc_u8:    (E, 2*I, K/32) plain e8m0 group scales,
+      shift_u8: (E, 2*I) per-column amax e8m0 (== production byte range base),
+      sw_f32:   (E, 2*I) 2^(shift - 127).
+
+    Raises if any column's e8m0 spread exceeds 5 octaves: the affine byte
+    synthesis is only bit-exact while every shifted value stays an e4m3fnuz
+    normal (checked column-by-column -- could be relaxed per-column later).
+    """
+    import torch
+
+    from aiter.ops.shuffle import shuffle_weight_a16w4
+
+    w = w1_ktr.view(torch.uint8) if w1_ktr.dtype != torch.uint8 else w1_ktr
+    s = w1_scale_ktr.view(torch.uint8)
+    I = inter_real
+    E = w.shape[0]
+    if w.ndim != 3 or s.ndim != 3:
+        raise ValueError(
+            f"w1/scale must be 3D, got {tuple(w.shape)} / {tuple(s.shape)}"
+        )
+    server_view = s.shape[-2] * 16 == w.shape[-2] and s.shape[-1] == w.shape[-1]
+    if server_view:
+        w_nk = w.transpose(-1, -2).contiguous()  # (E, N_pad, K_pack)
+        s_nk = s.transpose(-1, -2).contiguous()  # (E, N_pad, K//32)
+    else:
+        w_nk = w.contiguous()
+        s_nk = s.contiguous()
+    n_pad = w_nk.shape[1]
+    assert n_pad >= 2 * I, f"N_pad {n_pad} < 2*inter_real {2 * I}"
+    pair = torch.cat(
+        [
+            torch.arange(0, 2 * I, 2, device=w_nk.device),
+            torch.arange(1, 2 * I, 2, device=w_nk.device),
+        ]
+    )
+    w_plain = w_nk.index_select(1, pair).contiguous()  # (E, 2I, K_pack)
+    s_plain = s_nk.index_select(1, pair).contiguous()  # (E, 2I, K//32)
+    w_shuf = shuffle_weight_a16w4(w_plain, 16, False)
+
+    shift = s_plain.amax(dim=2)  # (E, 2I) u8, per-column max exponent byte
+    spread = (shift.unsqueeze(-1).to(torch.int16) - s_plain.to(torch.int16)).max()
+    if int(spread.item()) > 5:
+        raise RuntimeError(
+            "repack_w13_pairwise_to_a8w4fp4: e8m0 per-column spread "
+            f"{int(spread.item())} > 5 octaves; the fp8 byte synthesis is not "
+            "bit-exact (shifted values would leave the e4m3fnuz normal range)"
+        )
+    sw = torch.exp2((shift.to(torch.int32) - 127).float()).contiguous()
+    return (
+        w_shuf.contiguous(),
+        s_plain.contiguous(),
+        shift.contiguous(),
+        sw.contiguous(),
+    )
 
 
 def requant_a_to_fp8(x_bf16, k_true):
@@ -530,5 +605,96 @@ def flydsl_a8w4_gemm2(
     return flat_out
 
 
+def flydsl_a8w4fp4_gemm1(
+    *,
+    a8_fp8,
+    s_a,
+    w_fp4_shuffled,
+    w_scale_u8,
+    w_shift_u8,
+    w_col_scale,
+    sorted_expert_ids,
+    cumsum_tensor,
+    sorted_token_ids,
+    sorted_out_rows,
+    inter_sorted_bf16,
+    n_tokens,
+    NE,
+    INTER,
+    KLEN,
+    topk,
+    swiglu_limit=10.0,
+    tile_m=32,
+    tile_n=192,
+    tile_k=64,
+    waves_per_eu=None,
+    b_nt=None,
+    a_stages=2,
+    xcd_swizzle=0,
+    act="silu_clamp",
+    stream=None,
+):
+    """a8w4-FP4W stage1 (iter-18): fp8 A x native mxfp4 W1, in-register fp8 synth.
+
+    ``a8_fp8``          e4m3fnuz [n_tokens, KLEN] from requant_hidden_fp8.
+    ``s_a``             fp32 [n_tokens + 1] per-token A scales (+1 pad row).
+    ``w_fp4_shuffled``  from repack_w13_pairwise_to_a8w4fp4 (a16w4 ``standard``
+                        N-major GGUU preshuffle, real 2*INTER columns).
+    ``w_scale_u8``      (E, 2*INTER, K/32) plain e8m0 group scales.
+    ``w_shift_u8``      (E, 2*INTER) per-column shift (amax e8m0).
+    ``w_col_scale``     fp32 (E, 2*INTER) = 2^(shift - 127) (epilog).
+    ``sorted_out_rows`` i32 [P]: aiter sorted output row per moe-sort position
+                        (-1 padding); from sorted_output_rows.
+    ``inter_sorted_bf16`` bf16 [aiter_rows, INTER] output (production contract).
+    """
+    _b_cache_mod = 2 if b_nt is None else b_nt
+    max_m_blocks = int(sorted_expert_ids.numel())
+    launch = compile_gemm1_a8w4fp4(
+        BM=tile_m,
+        NE=NE,
+        INTER=INTER,
+        KLEN=KLEN,
+        TOPK=topk,
+        TILE_N=tile_n,
+        TILE_K=tile_k,
+        b_cache_mod=_b_cache_mod,
+        a_stages=a_stages,
+        xcd_swizzle=xcd_swizzle,
+        waves_per_eu=waves_per_eu,
+        act=act,
+        rocm_arch=str(get_rocm_arch()),
+    )
+    grid = gemm1_a8w4fp4_grid(
+        tile_m, INTER=INTER, TILE_N=tile_n, max_m_blocks=max_m_blocks
+    )
+    _run_compiled(
+        launch,
+        a8_fp8.data_ptr(),
+        w_fp4_shuffled.data_ptr(),
+        w_scale_u8.data_ptr(),
+        w_shift_u8.data_ptr(),
+        sorted_expert_ids.data_ptr(),
+        cumsum_tensor.to(torch.int32).contiguous().data_ptr(),
+        sorted_token_ids.data_ptr(),
+        sorted_out_rows.data_ptr(),
+        s_a.data_ptr(),
+        w_col_scale.view(-1).contiguous().data_ptr(),
+        int(n_tokens),
+        int(max_m_blocks),
+        int(grid),
+        int(inter_sorted_bf16.shape[0]),
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        float(swiglu_limit),
+        inter_sorted_bf16.data_ptr(),
+        torch.cuda.current_stream() if stream is None else stream,
+    )
+    return inter_sorted_bf16
+
+
 # iter-14 server wire-in (imports the wrappers above; keep at module end).
 from .stage2_a8w4_server import gather_requant_fp8, moe_stage2_a8w4_forward
+# iter-18 server wire-in (imports the wrappers above; keep at module end).
+from .stage1_a8w4fp4_server import requant_hidden_fp8, moe_stage1_a8w4fp4_forward
