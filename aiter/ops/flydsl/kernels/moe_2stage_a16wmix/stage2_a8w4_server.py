@@ -191,18 +191,27 @@ def moe_stage2_a8w4_forward(
         accumulate=True,
     )
     P = stids.numel()
+    _capturing = torch.cuda.is_current_stream_capturing()
     if _DEBUG:
-        torch.cuda.synchronize()
-        smax = int(scatter_idx.to(torch.int64).max().item()) if scatter_idx.numel() else -1
-        e_smax = int(stids.to(torch.int64).max().item()) if P else -1
         print(
             f"[iter14-g2-debug] sorted: P={P} seids={tuple(seids.shape)}"
-            f" nvid0={int(nvid[0].item())} scatter_max={smax} stids_max={e_smax}"
-            f" mbuf={tuple(mbuf.shape)}",
+            f" mbuf={tuple(mbuf.shape)} capturing={_capturing}",
             flush=True,
         )
-        assert P < (1 << 21), f"absurd sorted size P={P}"
-        assert smax < rows, f"scatter value {smax} >= intermediate rows {rows}"
+        if not _capturing:
+            torch.cuda.synchronize()
+            smax = (
+                int(scatter_idx.to(torch.int64).max().item())
+                if scatter_idx.numel()
+                else -1
+            )
+            n0 = int(nvid[0].item())
+            print(
+                f"[iter14-g2-debug] nvid0={n0} scatter_max={smax}",
+                flush=True,
+            )
+            assert P < (1 << 21), f"absurd sorted size P={P}"
+            assert smax < rows, f"scatter value {smax} >= intermediate rows {rows}"
 
     a8, s_a, cw = gather_requant_fp8(
         intermediate,
@@ -241,6 +250,6 @@ def moe_stage2_a8w4_forward(
         b_v16=b_v16,
         xcd_swizzle=xcd_swizzle,
     )
-    if _DEBUG:
+    if _DEBUG and not _capturing:
         torch.cuda.synchronize()
     return out
