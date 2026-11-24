@@ -173,6 +173,12 @@ class PrefixGroups(NamedTuple):
     fill: torch.Tensor  # [S] int32
     gid: torch.Tensor  # [S] int32
     gbase: torch.Tensor  # [S] int32
+    # A mixed batch (short rows beside prompt chunks): its leading num_seqs
+    # sequences (num_tokens tokens, at most max_query_len each) are the short rows
+    # the groups were built from; 0 when the whole batch is short.
+    num_seqs: int = 0
+    num_tokens: int = 0
+    max_query_len: int = 0
 
 
 def alloc_prefix_groups(
@@ -626,7 +632,17 @@ def unified_attention(
                 _unified_attention_2d_gfx1250(params)
             elif DEVICE_ARCH == "gfx950":
                 short = _gfx950_mixed_short_params(params)
-                if short is not None:
+                lead = _gfx950_mixed_prefix_params(params, short, prefix_groups)
+                if lead is not None:
+                    # the leading short rows with their groups' prefixes read once
+                    config = get_unified_attention_config(
+                        "kv_split", _gfx950_split_params(lead), backend="gluon"
+                    )
+                    NUM_SEGMENTS, TILE_SIZE = _split_launch_config(config)
+                    _unified_attention_prefix_gfx950(
+                        lead, prefix_groups, NUM_SEGMENTS, TILE_SIZE
+                    )
+                elif short is not None:
                     config = get_unified_attention_config(
                         "kv_split", _gfx950_split_params(short), backend="gluon"
                     )
@@ -1503,6 +1519,42 @@ def _gfx950_prefix_supported(params: _UAParams, pg: PrefixGroups):
         and not params.skip_reduce
         and params.head_size_v == params.head_size
     )
+
+
+def _gfx950_mixed_prefix_params(params: _UAParams, short, pg):
+    """The leading short rows of a mixed batch as a short-query call, or None.
+
+    Only when the short launch applies and the groups were built from the batch's
+    leading pg.num_seqs sequences (the short rows, which the batch order puts
+    first): the 2d launch then skips every row up to short.max_seqlen_q, so the
+    leading rows must be exactly those.
+    """
+    if short is None or pg is None or not pg.num_seqs:
+        return None
+    ns, nt = pg.num_seqs, pg.num_tokens
+    if not (0 < pg.max_query_len <= short.max_seqlen_q) or nt > params.num_tokens:
+        return None
+    # the query-block bound unified_attention derives for a batch of its own
+    block_q = max(16, triton.next_power_of_2(params.num_queries_per_kv)) // (
+        params.num_queries_per_kv
+    )
+    q_blocks = ns if pg.max_query_len == 1 else nt // block_q + ns
+    lead = params._replace(
+        q=params.q[:nt],
+        out=params.out[:nt],
+        cu_seqlens_q=params.cu_seqlens_q[: ns + 1],
+        seqused_k=params.seqused_k[:ns],
+        block_table=params.block_table[:ns],
+        num_seqs=ns,
+        num_tokens=nt,
+        max_seqlen_q=pg.max_query_len,
+        all_decode=pg.max_query_len == 1,
+        total_num_q_blocks=q_blocks,
+        num_2d_prgms=q_blocks * params.num_kv_heads,
+    )
+    if not _gfx950_prefix_supported(lead, pg):
+        return None
+    return lead
 
 
 def _unified_attention_prefix_gfx950(
