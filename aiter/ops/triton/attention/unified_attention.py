@@ -10,6 +10,14 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_3d,
     reduce_segments,
 )
+from aiter.ops.triton._triton_kernels.attention.unified_attention_prefix import (
+    _pg_fill_kernel,
+    _pg_group_kernel,
+    _pg_leader_kernel,
+    _pg_member_kernel,
+    _pg_merge_kernel,
+    _pg_score_kernel,
+)
 from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
@@ -136,6 +144,158 @@ class _UAParams(NamedTuple):
     v_descale: torch.Tensor | None = None
     output_scale: torch.Tensor | None = None
     skip_reduce: bool = False
+
+
+class PrefixGroups(NamedTuple):
+    """One step's shared-prefix groups, in fixed buffers that build_prefix_groups
+    fills on the GPU (so a CUDA graph can replay a call that reads them).
+
+    Sequences whose block tables start with the same physical blocks (prefix-cache
+    hits on one conversation) form a group. For short queries (speculative-decode
+    verify) unified_attention then reads each group's shared prefix once, as one
+    attention of all the group's query rows, instead of once per sequence.
+    """
+
+    max_groups: int
+    seq_shift: torch.Tensor  # [S] int32 shared blocks of each sequence (0: private)
+    seq_priv: torch.Tensor  # [S] int32 private tail length
+    bt_priv: torch.Tensor  # [S, W] int32 block table of the private tail
+    grp_cu: torch.Tensor  # [G + 1] int32 virtual token offsets per group
+    grp_len: torch.Tensor  # [G] int32 shared tokens per group
+    bt_grp: torch.Tensor  # [G, W] int32 block table of each group's prefix
+    vtok_src: torch.Tensor  # [T] int32 real token of each virtual token
+    tok_vtok: torch.Tensor  # [T] int32 virtual token of each real token, -1 if private
+    # scratch of build_prefix_groups
+    leader: torch.Tensor  # [S] int32
+    run: torch.Tensor  # [S] int32
+    best: torch.Tensor  # [S] int64
+    gtok: torch.Tensor  # [S] int32
+    fill: torch.Tensor  # [S] int32
+    gid: torch.Tensor  # [S] int32
+    gbase: torch.Tensor  # [S] int32
+    # A mixed batch (short rows beside prompt chunks): its leading num_seqs
+    # sequences (num_tokens tokens, at most max_query_len each) are the short rows
+    # the groups were built from; 0 when the whole batch is short.
+    num_seqs: int = 0
+    num_tokens: int = 0
+    max_query_len: int = 0
+
+
+def alloc_prefix_groups(
+    max_seqs: int,
+    max_tokens: int,
+    max_blocks_per_seq: int,
+    max_groups: int = 32,
+    device=None,
+) -> PrefixGroups:
+    i32 = dict(dtype=torch.int32, device=device)
+    return PrefixGroups(
+        max_groups=max_groups,
+        seq_shift=torch.zeros(max_seqs, **i32),
+        seq_priv=torch.zeros(max_seqs, **i32),
+        bt_priv=torch.zeros(max_seqs, max_blocks_per_seq, **i32),
+        grp_cu=torch.zeros(max_groups + 1, **i32),
+        grp_len=torch.zeros(max_groups, **i32),
+        bt_grp=torch.zeros(max_groups, max_blocks_per_seq, **i32),
+        vtok_src=torch.zeros(max_tokens, **i32),
+        tok_vtok=torch.full((max_tokens,), -1, **i32),
+        leader=torch.zeros(max_seqs, **i32),
+        run=torch.zeros(max_seqs, **i32),
+        best=torch.zeros(max_seqs, dtype=torch.int64, device=device),
+        gtok=torch.zeros(max_seqs, **i32),
+        fill=torch.zeros(max_seqs, **i32),
+        gid=torch.zeros(max_seqs, **i32),
+        gbase=torch.zeros(max_seqs, **i32),
+    )
+
+
+def build_prefix_groups(
+    pg: PrefixGroups,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    block_size: int,
+    min_group: int = 4,
+    min_blocks: int = 4,
+):
+    """Find the step's groups into pg: five launches with fixed grids, no host sync.
+
+    A group needs min_group members sharing at least min_blocks leading blocks.
+    Rows past len(seq_lens) and tokens past query_start_loc[-1] stay private.
+    """
+    n = seq_lens.shape[0]
+    S_max = pg.seq_shift.shape[0]
+    T_max = pg.tok_vtok.shape[0]
+    W = block_table.shape[1]
+    assert n <= S_max and W <= pg.bt_priv.shape[1]
+    assert pg.max_groups < 65536 and W < 65536 and min_blocks >= 1
+    N_PAD = triton.next_power_of_2(max(S_max, 2))
+    W_PAD = triton.next_power_of_2(max(pg.bt_priv.shape[1], 2))
+    grid = (S_max,)
+    _pg_leader_kernel[grid](
+        block_table,
+        block_table.stride(0),
+        seq_lens,
+        query_start_loc,
+        n,
+        T_max,
+        T_max,
+        pg.leader,
+        pg.run,
+        pg.best,
+        pg.gtok,
+        pg.fill,
+        pg.vtok_src,
+        pg.tok_vtok,
+        BLOCK_SIZE=block_size,
+        MIN_BLOCKS=min_blocks,
+        N_PAD=N_PAD,
+        W_PAD=W_PAD,
+        TOK_CHUNK=triton.next_power_of_2(triton.cdiv(T_max, S_max)),
+    )
+    _pg_score_kernel[grid](
+        pg.leader, pg.run, pg.best, n, MIN_GROUP=min_group, MIN_BLOCKS=min_blocks,
+        N_PAD=N_PAD,
+    )
+    _pg_member_kernel[grid](pg.leader, pg.run, pg.best, pg.gtok, query_start_loc, n)
+    _pg_group_kernel[(1,)](
+        pg.best,
+        pg.gtok,
+        pg.gid,
+        pg.gbase,
+        pg.grp_cu,
+        pg.grp_len,
+        n,
+        BLOCK_SIZE=block_size,
+        MAX_GROUPS=pg.max_groups,
+        N_PAD=N_PAD,
+        G_PAD=triton.next_power_of_2(pg.max_groups + 1),
+        num_warps=8,
+    )
+    _pg_fill_kernel[grid](
+        block_table,
+        block_table.stride(0),
+        seq_lens,
+        query_start_loc,
+        n,
+        W,
+        pg.leader,
+        pg.run,
+        pg.best,
+        pg.fill,
+        pg.gid,
+        pg.gbase,
+        pg.seq_shift,
+        pg.seq_priv,
+        pg.bt_priv,
+        pg.bt_priv.stride(0),
+        pg.bt_grp,
+        pg.bt_grp.stride(0),
+        pg.vtok_src,
+        pg.tok_vtok,
+        BLOCK_SIZE=block_size,
+        W_PAD=W_PAD,
+    )
 
 
 def _gfx950_gluon_supported(params: _UAParams):
@@ -312,6 +472,8 @@ def unified_attention(
     skip_reduce: bool = False,
     # backend
     backend: str | None = None,  # "triton" | "gluon"
+    # shared-prefix groups of the step (build_prefix_groups), for short queries
+    prefix_groups: PrefixGroups | None = None,
 ):
     assert causal, "Only causal attention is supported"
 
@@ -470,7 +632,17 @@ def unified_attention(
                 _unified_attention_2d_gfx1250(params)
             elif DEVICE_ARCH == "gfx950":
                 short = _gfx950_mixed_short_params(params)
-                if short is not None:
+                lead = _gfx950_mixed_prefix_params(params, short, prefix_groups)
+                if lead is not None:
+                    # the leading short rows with their groups' prefixes read once
+                    config = get_unified_attention_config(
+                        "kv_split", _gfx950_split_params(lead), backend="gluon"
+                    )
+                    NUM_SEGMENTS, TILE_SIZE = _split_launch_config(config)
+                    _unified_attention_prefix_gfx950(
+                        lead, prefix_groups, NUM_SEGMENTS, TILE_SIZE
+                    )
+                elif short is not None:
                     config = get_unified_attention_config(
                         "kv_split", _gfx950_split_params(short), backend="gluon"
                     )
@@ -479,6 +651,7 @@ def unified_attention(
                         short, out, out, out, 1, TILE_SIZE,
                         max_query_len=short.max_seqlen_q,
                     )
+                if short is not None:
                     _unified_attention_2d_gfx950(
                         params, min_query_len=short.max_seqlen_q + 1
                     )
@@ -504,6 +677,16 @@ def unified_attention(
             TILE_SIZE = block_size
         else:
             TILE_SIZE = CONFIG_TILE_SIZE
+
+        if (
+            prefix_groups is not None
+            and use_gluon_3d
+            and DEVICE_ARCH == "gfx950"
+            and _gfx950_prefix_supported(params, prefix_groups)
+        ):
+            return _unified_attention_prefix_gfx950(
+                params, prefix_groups, NUM_SEGMENTS, TILE_SIZE
+            )
 
         if NUM_SEGMENTS > 1:
             segm_output = torch.empty(
@@ -1314,3 +1497,148 @@ def _unified_attention_3d_gfx950(
         partial_l=segm_expsum if split else None,
         max_query_len=max_query_len,
     )
+
+
+# A batch needs this many sequences before its groups' prefixes are read once: below it
+# the shared launch cannot fill the GPU and the plain decode grid is faster. Callers
+# need not build groups for smaller batches.
+PREFIX_GROUPS_MIN_SEQS = 16
+
+
+def _gfx950_prefix_supported(params: _UAParams, pg: PrefixGroups):
+    """Short queries (spec-decode verify) on the decode grid, plain causal attention."""
+    return (
+        not params.all_decode
+        and _gfx950_short_query_3d(params)
+        and params.num_seqs >= PREFIX_GROUPS_MIN_SEQS
+        and params.num_seqs <= pg.seq_shift.shape[0]
+        and params.num_tokens <= pg.tok_vtok.shape[0]
+        and params.block_table.shape[1] <= pg.bt_priv.shape[1]
+        and params.causal
+        and params.sliding_window <= 0
+        and params.sinks is None
+        and not params.shuffled_kv_cache
+        and not params.skip_reduce
+        and params.head_size_v == params.head_size
+    )
+
+
+def _gfx950_mixed_prefix_params(params: _UAParams, short, pg):
+    """The leading short rows of a mixed batch as a short-query call, or None.
+
+    Only when the short launch applies and the groups were built from the batch's
+    leading pg.num_seqs sequences (the short rows, which the batch order puts
+    first): the 2d launch then skips every row up to short.max_seqlen_q, so the
+    leading rows must be exactly those.
+    """
+    if short is None or pg is None or not pg.num_seqs:
+        return None
+    ns, nt = pg.num_seqs, pg.num_tokens
+    if not (0 < pg.max_query_len <= short.max_seqlen_q) or nt > params.num_tokens:
+        return None
+    # the query-block bound unified_attention derives for a batch of its own
+    block_q = max(16, triton.next_power_of_2(params.num_queries_per_kv)) // (
+        params.num_queries_per_kv
+    )
+    q_blocks = ns if pg.max_query_len == 1 else nt // block_q + ns
+    lead = params._replace(
+        q=params.q[:nt],
+        out=params.out[:nt],
+        cu_seqlens_q=params.cu_seqlens_q[: ns + 1],
+        seqused_k=params.seqused_k[:ns],
+        block_table=params.block_table[:ns],
+        num_seqs=ns,
+        num_tokens=nt,
+        max_seqlen_q=pg.max_query_len,
+        all_decode=pg.max_query_len == 1,
+        total_num_q_blocks=q_blocks,
+        num_2d_prgms=q_blocks * params.num_kv_heads,
+    )
+    if not _gfx950_prefix_supported(lead, pg):
+        return None
+    return lead
+
+
+def _unified_attention_prefix_gfx950(
+    params: _UAParams, pg: PrefixGroups, NUM_SEGMENTS: int, TILE_SIZE: int
+):
+    """Short queries with their groups' shared prefixes read once.
+
+    shared:  the groups as a virtual batch, one sequence per group whose query is
+             every member's tokens (gathered by vtok_src) and whose keys are the shared
+             blocks, on the prefill grid without a causal mask (every query token
+             follows the whole prefix), split over the prefix into fp32 partials
+    private: each sequence's tail (bt_priv, seq_priv) on the decode grid, as the call
+             would run without groups, into fp32 partials
+    merge:   both sets of partials by their log-sum-exp into out
+
+    A sequence outside every group has an empty shared part and its whole context
+    as the tail, so a batch without groups costs the empty shared launch only.
+    """
+    q = params.q
+    T, NH, D = q.shape
+    dev = q.device
+    G = pg.max_groups
+    # the shared launch's split: enough programs for a batch of a few groups
+    SH = 8 if T >= 128 else 16
+    P = max(2, NUM_SEGMENTS)
+    f32 = dict(dtype=torch.float32, device=dev)
+    q_v = torch.index_select(q, 0, pg.vtok_src[:T])
+    s_acc = torch.empty(T, NH, SH, D, **f32)
+    s_m = torch.empty(T, NH, SH, **f32)
+    s_l = torch.empty(T, NH, SH, **f32)
+    shared = params._replace(
+        q=q_v,
+        cu_seqlens_q=pg.grp_cu,
+        seqused_k=pg.grp_len,
+        block_table=pg.bt_grp,
+        causal=False,
+        num_seqs=G,
+        max_seqlen_q=T,
+        output_scale=None,
+    )
+    config = get_unified_attention_config("attn_2d", shared, backend="gluon")
+    BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
+    _unified_attention_gfx950(
+        shared,
+        config,
+        BLOCK_M=BLOCK_M,
+        TILE_SIZE=TILE_SIZE,
+        num_warps=config["num_warps"],
+        NUM_SEGMENTS=SH,
+        partial_acc=s_acc,
+        partial_m=s_m,
+        partial_l=s_l,
+    )
+    p_acc = torch.empty(T, NH, P, D, **f32)
+    p_m = torch.empty(T, NH, P, **f32)
+    p_l = torch.empty(T, NH, P, **f32)
+    private = params._replace(seqused_k=pg.seq_priv, block_table=pg.bt_priv)
+    _unified_attention_3d_gfx950(
+        private, p_acc, p_m, p_l, P, TILE_SIZE, max_query_len=int(params.max_seqlen_q)
+    )
+    _pg_merge_kernel[(T, NH)](
+        params.out,
+        params.out.stride(0),
+        params.out.stride(1),
+        params.output_scale,
+        p_acc,
+        p_m,
+        p_l,
+        s_acc,
+        s_m,
+        s_l,
+        params.cu_seqlens_q,
+        params.num_seqs,
+        pg.seq_priv,
+        pg.seq_shift,
+        pg.tok_vtok,
+        NH=NH,
+        D=D,
+        P=P,
+        SH=SH,
+        TILE=TILE_SIZE,
+        BLOCK_SIZE=params.block_size,
+        num_warps=4,
+    )
+    return params.out
