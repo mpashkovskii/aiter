@@ -1511,6 +1511,10 @@ def _gfx950_prefix_supported(params: _UAParams, pg: PrefixGroups):
         not params.all_decode
         and _gfx950_short_query_3d(params)
         and params.num_seqs >= PREFIX_GROUPS_MIN_SEQS
+        # groups built from a mixed batch's leading rows cover only those rows: a
+        # batch whose longest row still fits the short launch (5 tokens at 6 query
+        # heads per kv head) must not read the other rows' unbuilt tails
+        and (not pg.num_seqs or pg.num_seqs == params.num_seqs)
         and params.num_seqs <= pg.seq_shift.shape[0]
         and params.num_tokens <= pg.tok_vtok.shape[0]
         and params.block_table.shape[1] <= pg.bt_priv.shape[1]
