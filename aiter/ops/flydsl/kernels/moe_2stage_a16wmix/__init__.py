@@ -39,6 +39,7 @@ __all__ = [
     "gemm2_a16w4_grid",
     "gemm2_a8w4_grid",
     "requant_w2_to_fp8col",
+    "repack_w13_pairwise_to_a16w4_shuffled",
     "requant_a_to_fp8",
     "gather_requant_fp8",
     "moe_stage2_a8w4_forward",
@@ -115,6 +116,72 @@ def requant_w2_to_fp8col(w2_u8, w2_scale, k_true, device=None, pair_k0=False):
     return w8b.view(E, N * KT), s_w.contiguous()
 
 
+def repack_w13_pairwise_to_a16w4_shuffled(w1_ktr, w1_scale_ktr, inter_real):
+    """DeepSeek-V4.1 production w13 pairwise fp4 G1 -> FlyDSL a16w4 gemm1 inputs.
+
+    Production vLLM storage (AiterW4A16ExpertsMonolithic, verified 100% against
+    the DeepSeek-V4.1-Flash checkpoint in iter-17 w13_layout_solve2):
+
+      - W: view shaped (E, K_pack, N_pad) with N the contiguous dim (physical
+        (E, N_pad, K_pack)), N_pad rows: gate/up *pairwise* interleaved at row
+        granularity (row = 2j + u; gate row 2j, up row 2j+1, j < inter_real),
+        low nibble = even k; rows [2*inter_real, N_pad) are zero pad.
+      - scales: view shaped (E, K//32, N_pad), e8m0 u8, same pairwise rows.
+
+    This repacks them -- layout only, no requantization, fp4 bytes untouched --
+    into the a16w4 gemm1 ``standard`` inputs on the REAL (unpadded) N_OUT =
+    2*inter_real columns:
+
+      - w1_shuf:    (E, 2*inter_real, K_pack) GGUU (gate block then up block)
+        plain k-inner, through shuffle_weight_a16w4.
+      - scale_shuf: matching shuffle_scale_a16w4 output.
+
+    Shrinks the W1 footprint and the G1 N-compute by N_pad/(2*inter_real)
+    (25% at 1536 -> 1152) and costs nothing at runtime (load-time pass).
+    ``w1_ktr``/``w1_scale_ktr`` may be the transposed server views; they are
+    re-materialized physically here.
+    """
+    import torch
+
+    from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
+
+    w = w1_ktr.view(torch.uint8) if w1_ktr.dtype != torch.uint8 else w1_ktr
+    s = w1_scale_ktr.view(torch.uint8)
+    I = inter_real
+    E = w.shape[0]
+    if w.ndim != 3 or s.ndim != 3:
+        raise ValueError(
+            f"w1/scale must be 3D, got {tuple(w.shape)} / {tuple(s.shape)}"
+        )
+    # Server contract: w1 as (E, K_pack, N_pad) and scales as (E, K//32,
+    # N_pad) -- N rows come last in both. Reorient to physical (E, N_pad, K).
+    server_view = s.shape[-2] * 16 == w.shape[-2] and s.shape[-1] == w.shape[-1]
+    if server_view:
+        w_nk = w.transpose(-1, -2).contiguous()  # (E, N_pad, K_pack)
+        s_nk = s.transpose(-1, -2).contiguous()  # (E, N_pad, K//32)
+    else:  # already physical (E, N_pad, K-dim)
+        w_nk = w.contiguous()
+        s_nk = s.contiguous()
+    assert s_nk.shape[-1] * 16 == w_nk.shape[-1], (
+        f"scale K groups {tuple(s_nk.shape)} vs packed W bytes {tuple(w_nk.shape)}"
+    )
+    n_pad = w_nk.shape[1]
+    assert n_pad >= 2 * I, f"N_pad {n_pad} < 2*inter_real {2*I}"
+    # GGUU row order [g0..g_{I-1}, u0..u_{I-1}] from pairwise rows [2j+u].
+    pair = torch.cat(
+        [
+            torch.arange(0, 2 * I, 2, device=w_nk.device),
+            torch.arange(1, 2 * I, 2, device=w_nk.device),
+        ]
+    )
+    w_plain = w_nk.index_select(1, pair).contiguous()  # (E, 2I, K_pack)
+    s_plain = s_nk.index_select(1, pair).contiguous()  # (E, 2I, K//32)
+    k_scale = s_plain.shape[-1]
+    w_shuf = shuffle_weight_a16w4(w_plain, 16, False)
+    s_shuf = shuffle_scale_a16w4(s_plain.view(E * 2 * I, k_scale), E, False)
+    return w_shuf, s_shuf
+
+
 def requant_a_to_fp8(x_bf16, k_true):
     """bf16 [rows, K_pad] intermediate -> (fp8 [rows, k_true], s_a [rows] fp32).
 
@@ -164,6 +231,7 @@ def flydsl_a16w4_gemm1(
     k_batch=1,
     k_wave=1,
     b_nt=None,
+    a_nt=None,
     xcd_swizzle=0,
     gate_mode="separated",
     act="silu",
@@ -211,13 +279,19 @@ def flydsl_a16w4_gemm1(
     # Tile config is fully CSV/registry-driven: the caller resolves tile_n/tile_k/
     # k_wave/b_nt/xcd_swizzle from the tuned kernelName1 and always passes them.
     b_cache_mod = 2 if b_nt is None else b_nt
+    # a_nt: A (activation) DMA cache modifier (None/2 = streaming, 0 = cached).
+    # A rows are re-read once per N-block, so caching pays off at small
+    # NUM_N_BLOCKS shapes like the unpadded DSV4.1 G1 (3 blocks at tn192).
+    a_cache_mod = 2 if a_nt is None else a_nt
     if D_HIDDEN % TILE_K != 0:
         raise NotImplementedError(
             f"a16w4 gemm1 requires D_HIDDEN (K) % {TILE_K} == 0, got H={D_HIDDEN}"
         )
-    if (2 * D_INTER) % 256 != 0:
+    # Whole 16-col W blocks / 32-col e8m0 scale groups are what the layout
+    # needs; 256 was the shipped-models' alignment (unpadded DSV4.1 G1 = 1152).
+    if (2 * D_INTER) % 32 != 0:
         raise NotImplementedError(
-            f"a16w4 gemm1 requires 2*D_INTER % 256 == 0, got D_INTER={D_INTER}"
+            f"a16w4 gemm1 requires 2*D_INTER % 32 == 0, got D_INTER={D_INTER}"
         )
     if D_INTER % TILE_N != 0:
         raise NotImplementedError(
@@ -234,6 +308,7 @@ def flydsl_a16w4_gemm1(
         TILE_K=TILE_K,
         act=act,
         b_cache_mod=b_cache_mod,
+        a_cache_mod=a_cache_mod,
         xcd_swizzle=xcd_swizzle,
         waves_per_eu=waves_per_eu,
         w_dtype=w_dtype,
