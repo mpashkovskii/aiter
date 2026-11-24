@@ -257,33 +257,42 @@ def _gemm1_body_a8w4fp4(
     def load_cb_tile(kt, col):
         """cb16 broadcast exponent offsets for the tile's K32i.
 
-        One aligned dword read covers all of the tile's K32i bytes
-        ((k32i0 % 4) is 0 for TILE_K=128, 0 or 2 for TILE_K=64, so the tile's
-        2-4 scale bytes always sit inside one aligned dword).
+        The tile's scale bytes are grouped 4 per aligned dword; a 64/128-K
+        tile's 2-4 bytes are always inside one dword, a 256-K tile's 8 bytes
+        span two consecutive aligned dwords.
         """
         k32i0 = kt * (TILE_K // 32)
-        w0 = _dword_at(sc_tiles, col.c_plain * fx.Int32(G) + (k32i0 & ~fx.Int32(3)))
-        l0 = k32i0 % fx.Int32(4)
+        k_unroll = TILE_K // 32
         out = []
-        for h in range_constexpr(TILE_K // 32):
-            sc = (w0.shrui((l0 + fx.Int32(h)) * fx.Int32(8))) & fx.Int32(0xFF)
-            d = sc - col.sh
-            cb = ((d << fx.Int32(3)) & fx.Int32(0xFF)) * fx.Int32(0x00010001)
-            out.append(fx.Int32(cb))
+        for q in range_constexpr(max(1, (TILE_K + 127) // 128)):
+            base_k32 = k32i0 + q * 4
+            aligned = (base_k32 // fx.Int32(4)) * fx.Int32(4)
+            w0 = _dword_at(sc_tiles, col.c_plain * fx.Int32(G) + aligned)
+            l0 = base_k32 - aligned
+            for h in range_constexpr(min(4, k_unroll - q * 4)):
+                sc = (w0.shrui((l0 + fx.Int32(h)) * fx.Int32(8))) & fx.Int32(0xFF)
+                d = sc - col.sh
+                cb = ((d << fx.Int32(3)) & fx.Int32(0xFF)) * fx.Int32(0x00010001)
+                out.append(fx.Int32(cb))
         return out
 
     def load_b_raw_tile(kt, col):
-        """Raw 8-nibble u32s for the tile's K32i: one 8B read per 64 K."""
+        """Raw 8-nibble u32s for the tile's K32i: one 8B read per 64 K.
+
+        Each 64-K pair lives inside the lane's 16B unit of its own K128
+        block; a 256-K tile spans two consecutive K128 blocks.
+        """
         k32i0 = kt * (TILE_K // 32)
-        base = (
-            col.n_blk * fx.Int32(40960)
-            + (k32i0 // fx.Int32(4)) * fx.Int32(1024)
-            + lane_div_16 * fx.Int32(256)
-            + col.n_intra * fx.Int32(16)
-        )
         raw = []
         for p in range_constexpr(TILE_K // 64):
-            off = base + ((k32i0 % fx.Int32(4)) * fx.Int32(4) + fx.Int32(p * 8))
+            k32i = k32i0 + p * 2
+            off = (
+                col.n_blk * fx.Int32(40960)
+                + (k32i // fx.Int32(4)) * fx.Int32(1024)
+                + lane_div_16 * fx.Int32(256)
+                + col.n_intra * fx.Int32(16)
+                + (k32i % fx.Int32(4)) * fx.Int32(4)
+            )
             r = fx.make_rmem_tensor(fx.make_layout(2, 1), fx.Int32)
             fx.copy(w_copy_atom64, fx.slice(w_tiles2, (None, off // fx.Int32(8))), r)
             v = fx.Vector(fx.memref_load_vec(r))
