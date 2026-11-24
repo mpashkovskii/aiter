@@ -240,6 +240,22 @@ def repack_w13_pairwise_to_a8w4fp4(w1_ktr, w1_scale_ktr, inter_real):
     s_plain = s_nk.index_select(1, pair).contiguous()  # (E, 2I, K//32)
     w_shuf = shuffle_weight_a16w4(w_plain, 16, False)
 
+    # iter-22: fragment-align the lane windows. The a16w4 "standard" shuffle
+    # logical layout is (E, N0=N/16, K0=K/64B, KL=4, NL=16, (LD=4)x4B), and one
+    # fp8-MMA lane fragment for (col, K32i) is the 4B window at LD offset. The
+    # kernel wants per (col, 64-K tile) an 8B contiguous read covering the two
+    # K32i of the tile: transpose KL and LD so the 16B unit is KL-major
+    # (byte(n0,k0,ld,nl,kl,b) = orig(n0,k0,kl,nl,ld,b)); layout-only, byte-
+    # identical content (v2 unit16 = 4 K32i lane-windows back to back).
+    N0 = w_shuf.shape[1] // 16
+    K0 = w_shuf.shape[2] // 64
+    w_shuf = (
+        w_shuf.view(E, N0, K0, 4, 16, 4, 4)  # (E, N0, K0, KL, NL, LD, B)
+        .permute(0, 1, 2, 5, 4, 3, 6)  # (E, N0, K0, LD, NL, KL, B)
+        .contiguous()
+        .view(E, 2 * I, -1)
+    )
+
     shift = s_plain.amax(dim=2)  # (E, 2I) u8, per-column max exponent byte
     spread = (shift.unsqueeze(-1).to(torch.int16) - s_plain.to(torch.int16)).max()
     if int(spread.item()) > 5:

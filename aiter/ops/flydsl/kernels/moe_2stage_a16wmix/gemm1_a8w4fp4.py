@@ -74,24 +74,6 @@ def _perm_b32(a, b, sel):
     return fx.Int32(rocdl.perm_b32(_raw(a), _raw(b), _raw(sel)))
 
 
-def _fp8_synth_half(sel, sign_shifted, cb16_i32):
-    """One nibble-parity half (4 k) of the fp8 fragment: LUT + offset + sign."""
-    base = _perm_b32(fx.Int32(_FP8_LUT_HI), fx.Int32(_FP8_LUT_LO), sel)
-    nz = ((sel + fx.Int32(0x7F7F7F7F)).shrui(fx.Int32(7))) & fx.Int32(0x01010101)
-    m16 = fx.Int32(0x00FF00FF)
-    e16 = base & m16
-    o16 = (base.shrui(fx.Int32(8))) & m16
-    se = (e16 + cb16_i32) & m16
-    so = (o16 + cb16_i32) & m16
-    # per-16-bit-lane masks 0 or 0xFF from the nz low byte
-    em = ((nz & m16) * fx.Int32(0xFF)) & m16
-    om = (((nz.shrui(fx.Int32(8))) & m16) * fx.Int32(0xFF)) & m16
-    res = (se & em) | ((so & om) << fx.Int32(8))
-    # sign: masked by nz (zero-magnitude must stay +0; 0x80 is FNUZ NaN)
-    res = res | (sign_shifted & (nz << fx.Int32(7)))
-    return fx.Int32(res)
-
-
 def _fp4w_win_to_fp8x8(raw_i32, cb16_i32):
     """Synthesize the 8 fp8 codes of one (col, K32i) B MMA fragment.
 
@@ -100,23 +82,42 @@ def _fp4w_win_to_fp8x8(raw_i32, cb16_i32):
     ``cb16_i32``: exponent offset broadcast into both 16-bit lanes'
     low bytes: cb = (((raw_e8m0 - shift_col) << 3) & 0xFF) * 0x00010001.
 
-    Returns [i32, i32]: the v2i32 fp8 fragment, byte order = ascending k,
-    with all carries contained in 16-bit lanes (code range [0x08, 0x4C]
-    excludes borrows; zero nibbles masked to 0x00 so FNUZ NaN 0x80 and
-    offset pollution of exact zeros both never occur).
+    Returns [i32, i32]: the v2i32 fp8 fragment, byte order = ascending k.
+
+    Chain (iter-22, ~33 ops vs the iter-18 original's ~52): per parity half,
+    the 16-bit-lane add absorbs the wrap-around carry of the two's-complement
+    exponent offset (correct modulo 256 because every shifted code stays a
+    byte), the zero-magnitude mask expands via a single dword multiply
+    (nz*0xFF is borrow-free for per-byte 0/1 lanes), and the sign bit rides
+    the same mask. v_perm_b32 selectors are ONE BYTE PER OUTPUT BYTE, valid
+    range 0..7 across the two source regs (>7 yields 0xFF).
     """
     c0 = fx.Int32(0x07070707)
+    m16 = fx.Int32(0x00FF00FF)
     sel_e = raw_i32 & c0  # mags of k 0,2,4,6 at bytes 0..3
     sel_o = (raw_i32.shrui(fx.Int32(4))) & c0  # mags of k 1,3,5,7
-    # even-k half: sign bits are raw bit3 of each byte of sel parity
+
+    def _half(sel, sign_shifted):
+        base = _perm_b32(fx.Int32(_FP8_LUT_HI), fx.Int32(_FP8_LUT_LO), sel)
+        # carry-safe exponent add: even bytes in even 16-bit lanes, odd
+        # shifted down and back; mask drops the carry into the odd lanes.
+        e16 = base & m16
+        o16 = (base.shrui(fx.Int32(8))) & m16
+        se = (e16 + cb16_i32) & m16
+        so = (o16 + cb16_i32) & m16
+        res = se | (so << fx.Int32(8))
+        # zero-magnitude mask: per-byte 0/1 -> 0x00/0xFF via one multiply
+        nz = ((sel + fx.Int32(0x7F7F7F7F)).shrui(fx.Int32(7))) & fx.Int32(0x01010101)
+        nzm = nz * fx.Int32(0xFF)
+        # zero-magnitude must stay +0; 0x80 is FNUZ NaN, hence masked sign
+        return (res & nzm) | (sign_shifted & nzm)
+
     sgn_e = (raw_i32 & fx.Int32(0x08080808)) << fx.Int32(4)
-    # odd-k half: sign already sits at bit 7
     sgn_o = raw_i32 & fx.Int32(0x80808080)
-    codes_e = _fp8_synth_half(sel_e, sgn_e, cb16_i32)  # fp8 of k 0,2,4,6
-    codes_o = _fp8_synth_half(sel_o, sgn_o, cb16_i32)  # fp8 of k 1,3,5,7
-    # interleave byte-wise (v_perm_b32 selectors are ONE BYTE PER OUTPUT BYTE,
-    # valid range 0..7 across the two source regs; >7 yields 0xFF):
-    # out0 = [e0,o0,e1,o1] -> sel bytes [0,4,1,5]; out1 = [e2,o2,e3,o3] -> [2,6,3,7]
+    codes_e = _half(sel_e, sgn_e)  # fp8 of k 0,2,4,6
+    codes_o = _half(sel_o, sgn_o)  # fp8 of k 1,3,5,7
+    # byte interleave: out0 = [e0,o0,e1,o1] -> sel bytes [0,4,1,5];
+    # out1 = [e2,o2,e3,o3] -> [2,6,3,7]
     return [
         _perm_b32(codes_o, codes_e, fx.Int32(0x05010400)),
         _perm_b32(codes_o, codes_e, fx.Int32(0x07030602)),
@@ -198,30 +199,30 @@ def _gemm1_body_a8w4fp4(
     inter_i32 = fx.Int32(INTER)
     n_out_i32 = fx.Int32(N_OUT)
 
-    # ---- B (W1 fp4 packed, a16w4 standard preshuffle) -----------------------
-    # layout (N_OUT/16, K/128, klane=4, nlane=16, 16B): byte =
-    #   n_blk*bl_stride_n0 + k128*1024 + klane*256 + n_intra*16 + p
-    bl_stride_n0 = (K // 128) * 1024
-    layout_b = fx.make_layout(
-        (N_OUT // 16, K // 128, 4, 16, 16),
-        (bl_stride_n0, 1024, 256, 16, 1),
-    )
-    _w_bytes = NE * N_OUT * (K // 2)
+    # ---- B (W1 fp4 packed, iter-22 fragment-aligned preshuffle) -------------
+    # v2 layout (N_OUT/16, K/128, LD=4, NL=16, 16B): the a16w4 "standard"
+    # preshuffle with KL and LD transposed, so one lane's 16 nibbles of a whole
+    # K128 block (4 K32i windows) are one contiguous 16B unit. One (col,
+    # 64-K tile) fragment pair is one 8B read inside it; two consecutive
+    # K tiles share the unit. Byte offset of the 8B read for K tile kt:
+    #   n_blk*40960 + (kt*TK/128)*1024 + ld*256 + n_intra*16
+    #   + ((kt*TK/32)%4)*4, 8-aligned.
     from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
         _global_i32_buffer_tiles,
     )
 
-    # 1-dword tile view: every (col, K32i) window is a single 4B read.
-    w_tiles1 = _global_i32_buffer_tiles(arg_bq, min(_w_bytes, 0xFFFFFFFF), 1)
-    w_copy_atom32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(b_cache_mod), fx.Int32)
+    _w_bytes = NE * N_OUT * (K // 2)
+    w_tiles2 = _global_i32_buffer_tiles(arg_bq, min(_w_bytes, 0xFFFFFFFF), 2)
+    w_copy_atom64 = fx.make_copy_atom(fx.rocdl.BufferCopy64b(b_cache_mod), fx.Int32)
 
     class _Col:
-        __slots__ = ("n_blk", "n_intra", "c_plain")
+        __slots__ = ("n_blk", "n_intra", "c_plain", "sh")
 
         def __init__(s, n_blk, n_intra, c_plain):
             s.n_blk = n_blk
             s.n_intra = n_intra
             s.c_plain = c_plain  # plain (e, N_OUT) column index for scale planes
+            s.sh = None  # hoisted per-column exponent shift (loop-invariant)
 
     expert_off = e * n_out_i32
 
@@ -232,61 +233,63 @@ def _gemm1_body_a8w4fp4(
         c = expert_off + t + lane_mod_16
         return _Col(c // fx.Int32(16), c % fx.Int32(16), c)
 
-    # Per (col, K32i): bytes [ld*4, ld*4+4) of the (K32i//4, K32i%4) slot ->
-    # read ONE dwordx2 (8B, the whole 8-nibble... no: 4B) -- a 4B window:
-    #   idx = n_blk*n0s + (K32i//4)*1024 + (K32i%4)*256 + n_intra*16 + ld*4
-    def load_b_pair(kt, col):
-        """Raw 8-nibble u32 per K32i of the tile (TILE_K // 32 of them)."""
-        raw = []
-        for h in range_constexpr(TILE_K // 32):
-            k32i = kt * (TILE_K // 32) + h
-            idx = fx.Int32(
-                crd2idx(
-                    [
-                        fx.Int64(col.n_blk),
-                        fx.Int64(k32i // fx.Int32(4)),
-                        fx.Int64(k32i % fx.Int32(4)),
-                        fx.Int64(col.n_intra),
-                        fx.Int64(lane_div_16 * fx.Int32(4)),
-                    ],
-                    layout_b,
-                )
-            )
-            # idx is a byte offset, 4-aligned (slot base is 16-aligned, ld*4
-            # in {0,4,8,12}): a single 4B read inside the 16B slot.
-            r = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
-            fx.copy(w_copy_atom32, fx.slice(w_tiles1, (None, idx // fx.Int32(4))), r)
-            v = fx.Vector(fx.memref_load_vec(r))
-            raw.append(fx.Int32(v[0]))
-        return raw
-
-    # scale: plain u8 (E, N_OUT, G); one byte per (col, K32i); read as a dword
-    # containing the byte and extract. shift: plain u8 (E, N_OUT).
+    # scale: plain u8 (E, N_OUT, G); one byte per (col, K32i).
     _sc_bytes = NE * N_OUT * G
     sc_tiles = _global_i32_buffer_tiles(arg_bscale, min(_sc_bytes, 0xFFFFFFFF), 1)
     sh_tiles = _global_i32_buffer_tiles(
         arg_bshift, min(NE * N_OUT, 0xFFFFFFFF), 1
     )
+    u8_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(0), fx.Int32)
 
-    def _u8_at(tiles, byte_idx):
+    def _dword_at(tiles, byte_idx):
         d = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Int32)
-        atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(0), fx.Int32)
-        fx.copy(atom, fx.slice(tiles, (None, byte_idx // fx.Int32(4))), d)
-        w0 = fx.Int32(fx.Vector(fx.memref_load_vec(d))[0])
-        sh = (byte_idx % fx.Int32(4)) * fx.Int32(8)
-        return (w0.shrui(sh)) & fx.Int32(0xFF)
+        fx.copy(u8_atom, fx.slice(tiles, (None, byte_idx // fx.Int32(4))), d)
+        return fx.Int32(fx.Vector(fx.memref_load_vec(d))[0])
 
-    def load_cb(kt, col):
-        """cb16 broadcast exponent offset per K32i of the tile."""
-        sh = _u8_at(sh_tiles, col.c_plain)
+    def _u8_of(w0, l):
+        return (w0.shrui((l % fx.Int32(4)) * fx.Int32(8))) & fx.Int32(0xFF)
+
+    def hoist_shift(col):
+        w0 = _dword_at(sh_tiles, col.c_plain)
+        col.sh = _u8_of(w0, col.c_plain)
+        return col
+
+    def load_cb_tile(kt, col):
+        """cb16 broadcast exponent offsets for the tile's K32i.
+
+        One aligned dword read covers all of the tile's K32i bytes
+        ((k32i0 % 4) is 0 for TILE_K=128, 0 or 2 for TILE_K=64, so the tile's
+        2-4 scale bytes always sit inside one aligned dword).
+        """
+        k32i0 = kt * (TILE_K // 32)
+        w0 = _dword_at(sc_tiles, col.c_plain * fx.Int32(G) + (k32i0 & ~fx.Int32(3)))
+        l0 = k32i0 % fx.Int32(4)
         out = []
         for h in range_constexpr(TILE_K // 32):
-            k32i = kt * (TILE_K // 32) + h
-            sc = _u8_at(sc_tiles, col.c_plain * fx.Int32(G) + k32i)
-            cb = ((sc - sh) << fx.Int32(3)) & fx.Int32(0xFF)
-            cb16 = cb | (cb << fx.Int32(16))
-            out.append(cb16)
+            sc = (w0.shrui((l0 + fx.Int32(h)) * fx.Int32(8))) & fx.Int32(0xFF)
+            d = sc - col.sh
+            cb = ((d << fx.Int32(3)) & fx.Int32(0xFF)) * fx.Int32(0x00010001)
+            out.append(fx.Int32(cb))
         return out
+
+    def load_b_raw_tile(kt, col):
+        """Raw 8-nibble u32s for the tile's K32i: one 8B read per 64 K."""
+        k32i0 = kt * (TILE_K // 32)
+        base = (
+            col.n_blk * fx.Int32(40960)
+            + (k32i0 // fx.Int32(4)) * fx.Int32(1024)
+            + lane_div_16 * fx.Int32(256)
+            + col.n_intra * fx.Int32(16)
+        )
+        raw = []
+        for p in range_constexpr(TILE_K // 64):
+            off = base + ((k32i0 % fx.Int32(4)) * fx.Int32(4) + fx.Int32(p * 8))
+            r = fx.make_rmem_tensor(fx.make_layout(2, 1), fx.Int32)
+            fx.copy(w_copy_atom64, fx.slice(w_tiles2, (None, off // fx.Int32(8))), r)
+            v = fx.Vector(fx.memref_load_vec(r))
+            raw.append(fx.Int32(v[0]))
+            raw.append(fx.Int32(v[1]))
+        return raw
 
     def load_b_tile(kt):
         """raw nibbles + cb, per ni, per gate/up, per K32i of the tile."""
@@ -294,7 +297,7 @@ def _gemm1_body_a8w4fp4(
         for cols in (cols_gate, cols_up):
             per_col = []
             for c in cols:
-                per_col.append((load_b_pair(kt, c), load_cb(kt, c)))
+                per_col.append((load_b_raw_tile(kt, c), load_cb_tile(kt, c)))
             res.append(per_col)
         return res
 
@@ -385,6 +388,10 @@ def _gemm1_body_a8w4fp4(
         col_g_i32.append(cb + lane_mod_16)
         cols_gate.append(col(by_n, n_tile_base, _ni16))
         cols_up.append(col(by_n, n_tile_base + inter_i32, _ni16))
+    # hoisted per-column exponent shift (loop-invariant): one dword read per
+    # (gate/up, ni) per CTA instead of per K-tile.
+    cols_gate = [hoist_shift(c) for c in cols_gate]
+    cols_up = [hoist_shift(c) for c in cols_up]
 
     # ---- accumulators ------------------------------------------------------
     acc_layout = fx.make_layout(4, 1)
