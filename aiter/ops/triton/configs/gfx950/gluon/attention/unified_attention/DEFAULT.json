@@ -305,6 +305,18 @@
       "TILE_SIZE_MAX": 64,
       "MAX_SEGMENTS": 128
     },
+    "D_GEQ_256.Q_EQ_2.DT_fp8_fp8": {
+      "SEGMENTS_PER_CU": 4,
+      "MFMA_DIM": 32,
+      "MIN_SEGMENTS": 8,
+      "SPLIT_MIN_TILES": 4,
+      "SPLIT_MIN_SHARE": 0,
+      "SEGMENT_TILE_MIN": 64,
+      "SEGMENT_TILE_MAX": 64,
+      "TILE_SIZE_MIN": 64,
+      "TILE_SIZE_MAX": 64,
+      "MAX_SEGMENTS": 64
+    },
     "DT_fp8_fp8": {
       "SEGMENTS_PER_CU": 4,
       "MFMA_DIM": 32,
