@@ -6,7 +6,10 @@
 # Groups are found on the GPU, into fixed buffers, with fixed grids and no host sync, so
 # the metadata can be built for a CUDA-graph replay:
 #   leader  each sequence's leader is the lowest-indexed eligible sequence with the same
-#           first block; run = the leading blocks it shares with the leader, capped so the
+#           block at index MIN_BLOCKS - 1 (a prefix-cache block stands for its whole
+#           prefix, so a request sharing fewer blocks, such as a short new prompt that
+#           joins a conversation, cannot become the leader and shorten everyone's run);
+#           run = the leading blocks it shares with the leader, capped so the
 #           sequence keeps its query tokens (and their keys) in its private tail
 #   score   a group takes the shared length S that maximizes members(run >= S) x S, so a
 #           short new prompt joining a group stays private instead of collapsing the prefix
@@ -49,7 +52,9 @@ def _pg_leader_kernel(
     q1 = tl.load(cu_ptr + offs + 1, mask=valid, other=0)
     cap = (L - (q1 - q0)) // BLOCK_SIZE
     elig = valid & (cap >= MIN_BLOCKS) & (q1 > q0)
-    first = tl.load(bt_ptr + offs.to(tl.int64) * bt_stride, mask=elig, other=-1)
+    first = tl.load(
+        bt_ptr + offs.to(tl.int64) * bt_stride + (MIN_BLOCKS - 1), mask=elig, other=-1
+    )
     cap_i = tl.sum(tl.where(offs == i, cap, 0))
     elig_i = tl.sum(tl.where((offs == i) & elig, 1, 0)) > 0
     f_i = tl.sum(tl.where(offs == i, first, 0))

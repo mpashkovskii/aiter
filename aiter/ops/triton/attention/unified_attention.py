@@ -228,7 +228,7 @@ def build_prefix_groups(
     T_max = pg.tok_vtok.shape[0]
     W = block_table.shape[1]
     assert n <= S_max and W <= pg.bt_priv.shape[1]
-    assert pg.max_groups < 65536 and W < 65536
+    assert pg.max_groups < 65536 and W < 65536 and min_blocks >= 1
     N_PAD = triton.next_power_of_2(max(S_max, 2))
     W_PAD = triton.next_power_of_2(max(pg.bt_priv.shape[1], 2))
     grid = (S_max,)
