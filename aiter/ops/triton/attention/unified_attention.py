@@ -544,6 +544,11 @@ def unified_attention(
                     TILE_SIZE,
                 )
             elif DEVICE_ARCH == "gfx950":
+                # Short queries (spec-decode verify) fit one query block per
+                # sequence: launch one program per sequence, as the mixed-batch
+                # short launch does, not the BLOCK_Q upper bound, whose
+                # early-exit programs skew the round-robin dispatch over XCDs.
+                short_q = not params.all_decode and _gfx950_short_query_3d(params)
                 _unified_attention_3d_gfx950(
                     params,
                     segm_output,
@@ -551,6 +556,7 @@ def unified_attention(
                     segm_expsum,
                     NUM_SEGMENTS,
                     TILE_SIZE,
+                    max_query_len=int(params.max_seqlen_q) if short_q else 0,
                 )
             else:
                 assert False, f"No gluon subwrapper for {DEVICE_ARCH}"
