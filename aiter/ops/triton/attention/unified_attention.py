@@ -651,6 +651,7 @@ def unified_attention(
                         short, out, out, out, 1, TILE_SIZE,
                         max_query_len=short.max_seqlen_q,
                     )
+                if short is not None:
                     _unified_attention_2d_gfx950(
                         params, min_query_len=short.max_seqlen_q + 1
                     )
