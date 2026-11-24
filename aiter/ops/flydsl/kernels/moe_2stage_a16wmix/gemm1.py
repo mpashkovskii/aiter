@@ -53,6 +53,7 @@ def _gemm1_body_a16w4(
     TOPK,
     act="silu",
     b_cache_mod=2,
+    a_cache_mod=2,
     w_dtype="fp4",
     w_layout="standard",
     k_wave=1,
@@ -172,7 +173,7 @@ def _gemm1_body_a16w4(
         a_num_bytes=fx.Int64(i32_ntok) * fx.Int64(c_k_div4) * fx.Int64(4),
         a_load_threads=a_load_threads,
         row_base_dwords=_a_row_base_dwords,
-        dma_cache_mod=2,
+        dma_cache_mod=a_cache_mod,
         dma_via_vgpr=_is_gfx942,
         k_grp_base_bytes=k_grp_base_bytes,
         A_SLOT_BYTES=A_SLOT_BYTES,
@@ -387,6 +388,7 @@ def compile_gemm1_a16w4_port(
     TILE_K=256,
     act="silu",
     b_cache_mod=2,
+    a_cache_mod=2,
     xcd_swizzle=0,
     waves_per_eu=None,
     w_dtype="fp4",
@@ -433,9 +435,12 @@ def compile_gemm1_a16w4_port(
     assert (
         _K % (k_wave * TILE_K) == 0
     ), f"D_HIDDEN (K) must be a multiple of k_wave*TILE_K, got {_K}, k_wave={k_wave}"
+    # N_OUT must fill whole 16-col W blocks and whole 32-col e8m0 scale
+    # groups (256 was the shipped-models' alignment, not a layout constraint;
+    # the unpadded DeepSeek-V4.1-Flash G1 has N_OUT=2*576=1152).
     assert (
-        _N_OUT % 256 == 0
-    ), f"2*D_INTER (N_OUT) must be a multiple of 256, got {_N_OUT}"
+        _N_OUT % 32 == 0
+    ), f"2*D_INTER (N_OUT) must be a multiple of 32, got {_N_OUT}"
     assert (
         _INTER % TILE_N == 0
     ), f"D_INTER must be a multiple of TILE_N={TILE_N}, got {_INTER}"
@@ -470,17 +475,19 @@ def compile_gemm1_a16w4_port(
 
     assert act in (
         "silu",
+        "silu_clamp",
         "swiglu",
         "situv2",
-    ), f"a16w4 gemm1 act must be 'silu', 'swiglu', or 'situv2', got {act!r}"
+    ), f"a16w4 gemm1 act must be 'silu', 'silu_clamp', 'swiglu', or 'situv2', got {act!r}"
     _act_tag = "" if act == "silu" else f"_{act}"
     _bcm_tag = "" if b_cache_mod == 2 else f"_bcm{b_cache_mod}"
+    _acm_tag = "" if a_cache_mod == 2 else f"_acm{a_cache_mod}"
     _xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     _wpe_tag = f"_w{waves_per_eu}" if waves_per_eu else ""
     _wd_tag = "" if w_dtype == "fp4" else f"_{w_dtype}"
     _wl_tag = "" if w_layout == "standard" else f"_{w_layout}"
     _kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
-    name_suffix = f"a16w4{_wd_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}_tn{TILE_N}{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}"
+    name_suffix = f"a16w4{_wd_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}_tn{TILE_N}{_act_tag}{_bcm_tag}{_acm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}"
 
     @fx.struct
     class SharedStorage:
@@ -538,7 +545,7 @@ def compile_gemm1_a16w4_port(
             else:
                 _tile = bx_i32
             # Runtime activation scalars; plain silu ignores them.
-            if const_expr(act in ("swiglu", "situv2")):
+            if const_expr(act in ("swiglu", "situv2", "silu_clamp")):
                 _situ = situ_params(
                     fx.Float32(f32_situ_beta),
                     fx.Float32(f32_situ_beta_rcp),
@@ -571,6 +578,7 @@ def compile_gemm1_a16w4_port(
                 TOPK=TOPK,
                 act=act,
                 b_cache_mod=b_cache_mod,
+                a_cache_mod=a_cache_mod,
                 w_dtype=w_dtype,
                 w_layout=w_layout,
                 k_wave=k_wave,

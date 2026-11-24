@@ -40,6 +40,19 @@ def silu_mul_batch(gs, us):
     return [gs[i] * sig[i] * us[i] for i in range(len(gs))]
 
 
+def silu_clamp_mul_batch(gs, us, neg_clamp_limit):
+    """Clamped plain SiLU (aiter ``_swiglu`` with alpha=1.0, no residual):
+    ``silu(min(gate, limit)) * clamp(up, -limit, limit)`` —
+    DeepSeek-V4.1 (``hidden_act: silu``, ``swiglu_limit: 10.0``) semantics.
+    ``neg_clamp_limit`` is ``-limit`` (host-negated; +inf limit -> no-op clamp).
+    """
+    out = []
+    for i in range(len(gs)):
+        g, u = clamp_gate_up(gs[i], us[i], neg_clamp_limit)
+        out.append(g * sigmoid_f32(g) * u)
+    return out
+
+
 def swiglu_mul_batch(gs, us, neg_clamp_limit):
     out = []
     for i in range(len(gs)):
@@ -126,11 +139,14 @@ def situ_params(beta, beta_rcp, linear_beta, linear_beta_rcp, swiglu_limit):
 def gate_up_act(act, gs, us, situ=None):
     """Fused gate+up epilogue activation: ``act(gate) * up``.
 
-    ``act`` is a compile-time string ("silu", "swiglu", or "situv2");
-    ``situ`` carries runtime activation parameters for the latter two modes.
+    ``act`` is a compile-time string ("silu", "silu_clamp", "swiglu", or
+    "situv2"); ``situ`` carries runtime activation parameters for the modes
+    that need them.
     """
     if const_expr(act == "situv2"):
         return situ_mul_batch(gs, us, *situ)
     if const_expr(act == "swiglu"):
         return swiglu_mul_batch(gs, us, situ.neg_clamp_limit)
+    if const_expr(act == "silu_clamp"):
+        return silu_clamp_mul_batch(gs, us, situ.neg_clamp_limit)
     return silu_mul_batch(gs, us)
