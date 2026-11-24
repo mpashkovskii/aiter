@@ -58,6 +58,7 @@ def _gemm1_body_a16w4(
     w_layout="standard",
     k_wave=1,
     rocm_arch="",
+    dbg_stub=0,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W) fused stage1 gemm1 body.
 
@@ -243,12 +244,7 @@ def _gemm1_body_a16w4(
     # ---- B tile load + compute helpers ----------------------------------------
     # One K tile of BOTH operands as a single value: the software pipeline below keeps
     # tile kt+1 in flight while kt runs its MFMAs, so it has to carry them together.
-    def load_b_tile(base_k):
-        g_sc = [b_loader.load_scale(base_k, c) for c in cols_gate]
-        u_sc = [b_loader.load_scale(base_k, c) for c in cols_up]
-        g_raw = [b_loader.load_raw(base_k, c) for c in cols_gate]
-        u_raw = [b_loader.load_raw(base_k, c) for c in cols_up]
-        return g_raw, u_raw, g_sc, u_sc
+    # (load_b_tile itself is defined below, next to the dbg_stub probe switch.)
 
     def preload_a(read_slot):
         # Read ALL current-tile A-LDS fragments up front, before the next tile's A-DMA
@@ -259,13 +255,40 @@ def _gemm1_body_a16w4(
             for mi in range_constexpr(m_repeat)
         ]
 
+    # iter-19 floor probe (compile-kwarg keyed, name-tagged: cache-safe):
+    # dbg_stub=1 raw-bitcast upconvert; 2 reuse dword0; 3 dword0 + no scale loads.
+    def _stub_frag(raw, ku, lean):
+        i32s = [
+            fx.Int32(_raw(raw[ku // 4][0 if lean else j])) for j in range_constexpr(4)
+        ]
+        v4 = fx.Vector.from_elements([_raw(x) for x in i32s], fx.Int32)
+        return v4.bitcast(fx.BFloat16)
+
+    def load_b_tile(base_k):
+        if const_expr(dbg_stub == 3):
+            # no scale reads: the most generous dequant-free floor (also drops
+            # the scalar scale VMEM loads, lowering live regs toward 2 CTAs/CU).
+            g_sc = [None] * len(cols_gate)
+            u_sc = [None] * len(cols_up)
+        else:
+            g_sc = [b_loader.load_scale(base_k, c) for c in cols_gate]
+            u_sc = [b_loader.load_scale(base_k, c) for c in cols_up]
+        g_raw = [b_loader.load_raw(base_k, c) for c in cols_gate]
+        u_raw = [b_loader.load_raw(base_k, c) for c in cols_up]
+        return g_raw, u_raw, g_sc, u_sc
+
     def compute_tile(b_tile, a_frags):
         # Accumulators are the enclosing rmem tensors, mutated in place.
         g_raw, u_raw, g_sc, u_sc = b_tile
         for ni in range_constexpr(num_acc_n):
             for ku in range_constexpr(k_unroll):
-                gb = b_loader.upconvert(g_raw[ni], ku, g_sc[ni][ku])
-                ub = b_loader.upconvert(u_raw[ni], ku, u_sc[ni][ku])
+                if const_expr(dbg_stub > 0):
+                    _lean = const_expr(dbg_stub >= 2)
+                    gb = _stub_frag(g_raw[ni], ku, _lean)
+                    ub = _stub_frag(u_raw[ni], ku, _lean)
+                else:
+                    gb = b_loader.upconvert(g_raw[ni], ku, g_sc[ni][ku])
+                    ub = b_loader.upconvert(u_raw[ni], ku, u_sc[ni][ku])
                 for mi in range_constexpr(m_repeat):
                     a8 = a_frags[mi][ku]
                     _mma(acc_gate[mi][ni], a8, gb)
@@ -394,6 +417,7 @@ def compile_gemm1_a16w4_port(
     w_dtype="fp4",
     w_layout="standard",
     k_wave=1,
+    dbg_stub=0,
     rocm_arch,
 ):
     """a16w4/a16wi4/a16w16 (bf16 A x mxfp4/int4/bf16 W1) fused stage1 builder.
@@ -487,7 +511,8 @@ def compile_gemm1_a16w4_port(
     _wd_tag = "" if w_dtype == "fp4" else f"_{w_dtype}"
     _wl_tag = "" if w_layout == "standard" else f"_{w_layout}"
     _kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
-    name_suffix = f"a16w4{_wd_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}_tn{TILE_N}{_act_tag}{_bcm_tag}{_acm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}"
+    _st_tag = f"_st{dbg_stub}" if dbg_stub else ""
+    name_suffix = f"a16w4{_wd_tag}{_wl_tag}_h{_K}_i{_INTER}_ne{NE}_bm{BM}_tn{TILE_N}{_act_tag}{_bcm_tag}{_acm_tag}{_xcd_tag}{_wpe_tag}{_kw_tag}{_st_tag}"
 
     @fx.struct
     class SharedStorage:
@@ -582,6 +607,7 @@ def compile_gemm1_a16w4_port(
                 w_dtype=w_dtype,
                 w_layout=w_layout,
                 k_wave=k_wave,
+                dbg_stub=dbg_stub,
                 rocm_arch=rocm_arch,
             )
 

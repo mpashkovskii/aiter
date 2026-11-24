@@ -233,6 +233,7 @@ def flydsl_a16w4_gemm1(
     b_nt=None,
     a_nt=None,
     xcd_swizzle=0,
+    dbg_stub=0,
     gate_mode="separated",
     act="silu",
     situ_beta=1.0,
@@ -314,6 +315,7 @@ def flydsl_a16w4_gemm1(
         w_dtype=w_dtype,
         w_layout=w_layout,
         k_wave=k_wave,
+        dbg_stub=dbg_stub,
         rocm_arch=str(get_rocm_arch()),
     )
     max_m_blocks = int(sorted_expert_ids.numel())
