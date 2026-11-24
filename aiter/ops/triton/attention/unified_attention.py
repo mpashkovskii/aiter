@@ -1500,8 +1500,9 @@ def _unified_attention_3d_gfx950(
 
 
 # A batch needs this many sequences before its groups' prefixes are read once: below it
-# the shared launch cannot fill the GPU and the plain decode grid is faster.
-_GFX950_PREFIX_MIN_SEQS = 16
+# the shared launch cannot fill the GPU and the plain decode grid is faster. Callers
+# need not build groups for smaller batches.
+PREFIX_GROUPS_MIN_SEQS = 16
 
 
 def _gfx950_prefix_supported(params: _UAParams, pg: PrefixGroups):
@@ -1509,7 +1510,7 @@ def _gfx950_prefix_supported(params: _UAParams, pg: PrefixGroups):
     return (
         not params.all_decode
         and _gfx950_short_query_3d(params)
-        and params.num_seqs >= _GFX950_PREFIX_MIN_SEQS
+        and params.num_seqs >= PREFIX_GROUPS_MIN_SEQS
         and params.num_seqs <= pg.seq_shift.shape[0]
         and params.num_tokens <= pg.tok_vtok.shape[0]
         and params.block_table.shape[1] <= pg.bt_priv.shape[1]
