@@ -258,11 +258,17 @@ def repack_w13_pairwise_to_a8w4fp4(w1_ktr, w1_scale_ktr, inter_real):
 
     shift = s_plain.amax(dim=2)  # (E, 2I) u8, per-column max exponent byte
     spread = (shift.unsqueeze(-1).to(torch.int16) - s_plain.to(torch.int16)).max()
-    if int(spread.item()) > 5:
+    # iter-22: the production DeepSeek-V4.1-Flash checkpoint contains columns
+    # with spread 6. That is still bit-exact: the smallest magnitude code is
+    # LUT[0.5]=0x38 and 0x38 + (-6 << 3) = 0x08, exactly the e4m3fnuz minimum
+    # normal (bias-8, exponent field 1). Only spread >= 7 pushed a shifted
+    # value below the normal range (0x38 - 56 = 0x00), so the guard is at 6.
+    if int(spread.item()) > 6:
         raise RuntimeError(
             "repack_w13_pairwise_to_a8w4fp4: e8m0 per-column spread "
-            f"{int(spread.item())} > 5 octaves; the fp8 byte synthesis is not "
-            "bit-exact (shifted values would leave the e4m3fnuz normal range)"
+            f"{int(spread.item())} > 6 octaves; the fp8 byte synthesis is "
+            "not bit-exact (shifted values would leave the e4m3fnuz normal "
+            "range)"
         )
     sw = torch.exp2((shift.to(torch.int32) - 127).float()).contiguous()
     return (
